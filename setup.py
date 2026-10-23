@@ -3,12 +3,8 @@ import re
 
 _version_re = re.compile(r"(?<=^__version__ = (\"|'))(.+)(?=\"|')")
 
-def get_version(rel_path: str) -> str:
-    """
-    Searches for the ``__version__ = `` line in a source code file.
 
-    https://packaging.python.org/en/latest/guides/single-sourcing-package-version/
-    """
+def get_version(rel_path: str) -> str:
     with open(rel_path, 'r') as f:
         matches = map(_version_re.search, f)
         filtered = filter(lambda m: m is not None, matches)
@@ -19,18 +15,18 @@ def get_version(rel_path: str) -> str:
 
 
 setup(
-    name='chris-plugin-template',
-    version=get_version('app.py'),
-    description='A ChRIS DS plugin template',
+    name='dicom_audit',
+    version=get_version('dicom_audit.py'),
+    description='A ChRIS plugin to audit DICOM de-identification by diffing identified and de-identified trees',
     author='FNNDSC',
     author_email='dev@babyMRI.org',
-    url='https://github.com/FNNDSC/python-chrisapp-template',
-    py_modules=['app'],
+    url='https://github.com/FNNDSC/pl-dicom_audit',
+    py_modules=['dicom_audit', 'audit_engine'],
     install_requires=['chris_plugin'],
     license='MIT',
     entry_points={
         'console_scripts': [
-            'commandname = app:main'
+            'dicom_audit = dicom_audit:main'
         ]
     },
     classifiers=[
@@ -41,7 +37,10 @@ setup(
     extras_require={
         'none': [],
         'dev': [
-            'pytest~=7.1'
+            'pytest~=7.1',
+            # Integration tests run the real header-anonymization engine
+            # (same pin as pl-dicom_anonymize) to produce realistic trees.
+            'dicom-anonymizer==1.0.13.post1',
         ]
     }
 )
