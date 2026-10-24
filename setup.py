@@ -17,7 +17,7 @@ def get_version(rel_path: str) -> str:
 setup(
     name='dicom_audit',
     version=get_version('dicom_audit.py'),
-    description='A ChRIS plugin to audit DICOM de-identification by diffing identified and de-identified trees',
+    description='A ChRIS plugin that records what pl-dicom_anonymize changed and scans its output for leaks',
     author='FNNDSC',
     author_email='dev@babyMRI.org',
     url='https://github.com/FNNDSC/pl-dicom_audit',
@@ -41,6 +41,9 @@ setup(
             # Integration tests run the real header-anonymization engine
             # (same pin as pl-dicom_anonymize) to produce realistic trees.
             'dicom-anonymizer==1.0.13.post1',
+            # End-to-end tests run the real pl-dicom_anonymize CLI. It is not
+            # on PyPI; pin its release tarball. See MAINTENANCE.md.
+            'dicom_anonymize @ https://github.com/FNNDSC/pl-dicom_anonymize/archive/refs/tags/1.2.0.tar.gz',
         ]
     }
 )

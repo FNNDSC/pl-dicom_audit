@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import json
+import re
 import warnings
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -44,9 +45,8 @@ BINARY_VRS = frozenset({"OB", "OW", "OF", "OD", "OL", "OV", "UN"})
 #: VRs searched by the residual-PHI scan.
 TEXT_VRS = frozenset({"AE", "DA", "DT", "LO", "LT", "PN", "SH", "ST", "UC", "UT"})
 
-#: Elements whose *retention* is recorded in the per-file log even when the
-#: value did not change. An unchanged PatientName is an audit finding; an
-#: unchanged Modality is not.
+#: Identifying elements. Their retention is called out separately in the
+#: summary (an unchanged PatientName matters; an unchanged Modality does not).
 WATCHED_KEYWORDS = frozenset({
     "PatientName", "PatientID", "OtherPatientIDs", "OtherPatientNames",
     "OtherPatientIDsSequence", "IssuerOfPatientID", "PatientBirthDate",
@@ -270,7 +270,7 @@ def diff_datasets(orig: Dataset, new: Dataset, prefix: str = "") -> list[Change]
 
         ro, rn = render(o), render(n)
         if ro == rn:
-            if not is_empty(ro) and (name in WATCHED_KEYWORDS or vr in DATE_VRS):
+            if not is_empty(ro):
                 changes.append(Change(path, tag_str(ref), name, vr, "retained", original=ro, new=rn))
             continue
         action = "emptied" if is_empty(rn) else "replaced"
@@ -341,31 +341,155 @@ def phi_needles(identified: Dataset, min_len: int) -> dict[str, str]:
     return needles
 
 
+#: Instance-identifying UIDs. Their original values must not survive anywhere
+#: in the anonymized output (SOPClassUID etc. are not identifying).
+UID_NEEDLE_KEYWORDS = (
+    "StudyInstanceUID", "SeriesInstanceUID", "SOPInstanceUID", "FrameOfReferenceUID",
+)
+
+
+def uid_needles(identified: pydicom.dataset.FileDataset) -> dict[str, str]:
+    """{original instance UID: source keyword}, including File Meta."""
+    out: dict[str, str] = {}
+    for kw in UID_NEEDLE_KEYWORDS:
+        v = _top(identified, kw)
+        if v:
+            out.setdefault(v, kw)
+    meta = getattr(identified, "file_meta", None)
+    if meta is not None:
+        v = _top(meta, "MediaStorageSOPInstanceUID")
+        if v:
+            out.setdefault(v, "MediaStorageSOPInstanceUID")
+    return out
+
+
+def _text_values(elem) -> list[str]:
+    """Searchable text of an element: text VRs as-is, UN (e.g. private tags
+    read implicitly) decoded as latin-1. Other binary VRs are not text."""
+    if elem.VR == "UN":
+        raw = bytes(elem.value or b"")
+        return [raw.decode("latin-1")] if raw else []
+    if elem.VR not in TEXT_VRS and elem.VR != "UI":
+        return []
+    rendered = render(elem)
+    values = rendered if isinstance(rendered, list) else [rendered]
+    return [v for v in values if isinstance(v, str) and v]
+
+
+def token_pattern(token: str) -> str:
+    """
+    Regex for one needle (already upper-case). Numeric values (IDs, dates)
+    must stand alone, i.e. not run into other letters or digits, so a short
+    accession number does not match inside a hex hash, a UID or a timestamp.
+    Everything else is a plain substring, so "DOE" is found in "DOE_JANE"
+    and "FOLLOW-UP DOE".
+    """
+    if token.isdigit():
+        return rf"(?<![0-9A-Z]){re.escape(token)}(?![0-9A-Z])"
+    return re.escape(token)
+
+
+def token_in(token: str, hay_upper: str) -> bool:
+    if token.isdigit():
+        return re.search(token_pattern(token), hay_upper) is not None
+    return token in hay_upper
+
+
 def find_residual_phi(deidentified: Dataset, needles: dict[str, str],
-                      acknowledged: frozenset[str], prefix: str = "") -> list[dict]:
+                      acknowledged: frozenset[str], prefix: str = "",
+                      uids: Optional[dict[str, str]] = None) -> list[dict]:
+    """
+    Search every element of a de-identified dataset (recursing into
+    sequences, including private and UN elements) for values from the
+    identified header.
+
+    needles: {UPPERCASE text token: source keyword} -- substring match in
+             text elements.
+    uids:    {original UID: source keyword} -- exact match in UI elements,
+             substring match in text elements.
+
+    Elements named in `acknowledged` are skipped (intentionally retained).
+    PixelData is never searched.
+    """
     hits: list[dict] = []
-    if not needles:
+    uids = uids or {}
+    if not needles and not uids:
         return hits
     for elem in deidentified:
+        if elem.tag == 0x7FE00010:
+            continue
         name = element_name(elem)
         path = prefix + name
         if elem.VR == "SQ":
             for i, item in enumerate(elem.value or []):
-                hits.extend(find_residual_phi(item, needles, acknowledged, f"{path}[{i}]."))
+                hits.extend(find_residual_phi(item, needles, acknowledged, f"{path}[{i}].", uids))
             continue
-        if name in acknowledged or elem.VR not in TEXT_VRS:
+        if name in acknowledged:
             continue
-        rendered = render(elem)
-        values = rendered if isinstance(rendered, list) else [rendered]
-        for v in values:
-            if not isinstance(v, str) or not v:
+        for v in _text_values(elem):
+            if elem.VR == "UI":
+                v = v.rstrip("\x00 ")
+                if v in uids:
+                    hits.append({"path": path, "keyword": name, "kind": "uid",
+                                 "source_keyword": uids[v], "matched": v})
                 continue
             hay = v.upper()
             for token, source in needles.items():
-                if token in hay:
-                    hits.append({"path": path, "keyword": name, "source_keyword": source,
-                                 "matched": token})
+                if token_in(token, hay):
+                    hits.append({"path": path, "keyword": name, "kind": "text",
+                                 "source_keyword": source, "matched": token})
+            for uid, source in uids.items():
+                if uid in v:
+                    hits.append({"path": path, "keyword": name, "kind": "uid",
+                                 "source_keyword": source, "matched": uid})
     return hits
+
+
+def find_residual_phi_in_file(deidentified: pydicom.dataset.FileDataset,
+                              identified: pydicom.dataset.FileDataset,
+                              min_len: int, acknowledged: frozenset[str]) -> list[dict]:
+    """Residual-PHI scan of one de-identified file (File Meta + dataset)
+    against the values of its own identified counterpart."""
+    needles = phi_needles(identified, min_len)
+    uids = uid_needles(identified)
+    hits = []
+    meta = getattr(deidentified, "file_meta", None)
+    if meta is not None:
+        hits.extend(find_residual_phi(meta, needles, acknowledged, "file_meta.", uids))
+    hits.extend(find_residual_phi(deidentified, needles, acknowledged, "", uids))
+    return hits
+
+
+class NeedleIndex:
+    """
+    Every identifying token seen across the whole run, for scanning things
+    that do not belong to one file pair: relative paths of the anonymized
+    tree and non-DICOM files in it. One compiled alternation, longest token
+    first, so a large run stays fast.
+    """
+
+    def __init__(self):
+        self.tokens: dict[str, str] = {}
+        self._rx = None
+
+    def add(self, needles: dict[str, str]):
+        for t, src in needles.items():
+            if t not in self.tokens:
+                self.tokens[t] = src
+                self._rx = None
+
+    def __len__(self):
+        return len(self.tokens)
+
+    def search(self, text: str) -> list[tuple[str, str]]:
+        """[(matched token, source keyword)], distinct, case-insensitive."""
+        if not self.tokens or not text:
+            return []
+        if self._rx is None:
+            alts = sorted(self.tokens, key=len, reverse=True)
+            self._rx = re.compile("|".join(token_pattern(a) for a in alts))
+        found = dict.fromkeys(m.group(0) for m in self._rx.finditer(text.upper()))
+        return [(t, self.tokens[t]) for t in found]
 
 
 # --------------------------------------------------------------------------
@@ -536,8 +660,8 @@ class Crosswalk:
             yield {
                 "original_patient_id": key,
                 "original_patient_name": "|".join(sorted(p.original_names)),
-                "deidentified_patient_id": "|".join(sorted(p.new_ids)),
-                "deidentified_patient_name": "|".join(sorted(p.new_names)),
+                "anonymized_patient_id": "|".join(sorted(p.new_ids)),
+                "anonymized_patient_name": "|".join(sorted(p.new_names)),
                 "pseudonym_consistent": len(p.new_ids) <= 1,
                 "date_handling": handling,
                 "date_offset_days": "" if offset is None else offset,
@@ -551,7 +675,7 @@ class Crosswalk:
             r = self.accessions[acc]
             yield {
                 "original_accession_number": acc,
-                "deidentified_accession_number": "|".join(sorted(r["new"])),
+                "anonymized_accession_number": "|".join(sorted(r["new"])),
                 "original_patient_id": "|".join(sorted(r["patients"])),
                 "original_study_instance_uid": "|".join(sorted(r["studies"])),
                 "consistent": len(r["new"]) <= 1,
@@ -566,7 +690,7 @@ class Crosswalk:
             yield {
                 "level": level(o),
                 "original_uid": o,
-                "deidentified_uid": "|".join(sorted(self.uid_fwd[o])),
+                "anonymized_uid": "|".join(sorted(self.uid_fwd[o])),
                 "occurrences": self.uid_refs[o],
                 "consistent": len(self.uid_fwd[o]) == 1,
             }

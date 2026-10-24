@@ -1,14 +1,20 @@
 """
-Fixtures build the same layout ChRIS produces when pl-topologicalcopy
-(--groupByInstance) joins the pixel-redaction and header-anonymization
-nodes:
+Shared fixtures.
+
+Trees use the layout ChRIS produces when pl-topologicalcopy (--groupByInstance)
+joins the original and the pl-dicom_anonymize nodes:
 
     inputdir/
-        pl-dicom_pixel_redact_1/   identified headers, scrubbed pixels
-        pl-dicom_anonymize_2/      de-identified tree + deidentification_summary.json
+        pl-dircopy_1/              original DICOMs
+        pl-dicom_anonymize_2/      anonymized tree + deidentification_summary.json
 
-The de-identified tree is produced with the real dicom-anonymizer engine at
-the same pin pl-dicom_anonymize uses, and a summary in that plugin's format.
+Integration tests build the anonymized tree in-process with the real
+dicom-anonymizer engine (same pin as pl-dicom_anonymize) and a summary in that
+plugin's format. End-to-end tests (test_e2e.py) run the real plugins instead.
+
+Directory names are deliberately free of PHI (p01, p02): pl-dicom_anonymize
+copies paths verbatim, so patient-named folders are themselves a leak, which
+has its own tests.
 """
 
 import json
@@ -22,12 +28,18 @@ from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
 from pydicom.sequence import Sequence
 from pydicom.uid import ExplicitVRLittleEndian, generate_uid
 
-IDENT = "pl-dicom_pixel_redact_1"
+ORIG = "pl-dircopy_1"
 ANON = "pl-dicom_anonymize_2"
 
+#: Every identifying value the fixtures put into headers.
+PHI_STRINGS = ("Doe", "Jane", "Roe", "Rick", "MRN001", "MRN002", "ACC1", "ACC2",
+               "19800101", "19700505", "20240301", "20240410", "General Hospital",
+               "Smith", "Robert")
 
-def make_dcm(path: Path, *, name, pid, acc, study, series, birth="19800101",
-             study_date="20240301", description="MR brain"):
+
+def make_dcm(path: Path, *, name="Doe^Jane", pid="MRN001", acc="ACC1", study=None,
+             series=None, birth="19800101", study_date="20240301",
+             description="MR brain", private=True):
     path.parent.mkdir(parents=True, exist_ok=True)
     meta = FileMetaDataset()
     meta.MediaStorageSOPClassUID = "1.2.840.10008.5.1.4.1.1.7"
@@ -40,8 +52,8 @@ def make_dcm(path: Path, *, name, pid, acc, study, series, birth="19800101",
     ds.AccessionNumber = acc
     ds.StudyDate = study_date
     ds.StudyTime = "101500"
-    ds.StudyInstanceUID = study
-    ds.SeriesInstanceUID = series
+    ds.StudyInstanceUID = study or generate_uid()
+    ds.SeriesInstanceUID = series or generate_uid()
     ds.SOPInstanceUID = meta.MediaStorageSOPInstanceUID
     ds.SOPClassUID = meta.MediaStorageSOPClassUID
     ds.InstitutionName = "General Hospital"
@@ -52,8 +64,9 @@ def make_dcm(path: Path, *, name, pid, acc, study, series, birth="19800101",
     ref.ReferencedSOPClassUID = meta.MediaStorageSOPClassUID
     ref.ReferencedSOPInstanceUID = ds.SOPInstanceUID
     ds.ReferencedImageSequence = Sequence([ref])
-    ds.add_new(0x00090010, "LO", "ACME")
-    ds.add_new(0x00091010, "LO", f"private note {pid}")
+    if private:
+        ds.add_new(0x00090010, "LO", "ACME")
+        ds.add_new(0x00091010, "LO", f"private note {pid}")
     ds.Rows = ds.Columns = 8
     ds.BitsAllocated = ds.BitsStored = 8
     ds.HighBit = 7
@@ -67,16 +80,17 @@ def make_dcm(path: Path, *, name, pid, acc, study, series, birth="19800101",
     return path
 
 
-def anonymize_tree(ident: Path, anon: Path, rules=None, statuses=None):
+def anonymize_tree(orig: Path, anon: Path, rules=None, statuses=None, summary=True):
     """
-    De-identify every .dcm under ident into anon (same relative paths) and
-    write a pl-dicom_anonymize style deidentification_summary.json.
-    statuses: {relpath: "failed"} to simulate per-file anonymizer failures.
+    Anonymize every .dcm under orig into anon (same relative paths) and,
+    unless summary=False, write a pl-dicom_anonymize style
+    deidentification_summary.json. statuses: {relpath: "failed"} simulates
+    per-file anonymizer failures (no output written, as the plugin does).
     """
     statuses = statuses or {}
     records = []
-    for src in sorted(ident.rglob("*.dcm")):
-        rel = str(src.relative_to(ident))
+    for src in sorted(orig.rglob("*.dcm")):
+        rel = str(src.relative_to(orig))
         status = statuses.get(rel, "processed")
         if status == "processed":
             dst = anon / rel
@@ -84,35 +98,44 @@ def anonymize_tree(ident: Path, anon: Path, rules=None, statuses=None):
             anonymize_dicom_file(str(src), str(dst), rules or {}, True)
         records.append({"path": rel, "path_hash": "x", "status": status})
     anon.mkdir(parents=True, exist_ok=True)
-    (anon / "deidentification_summary.json").write_text(json.dumps({
-        "plugin_version": "1.2.0",
-        "upstream_dicom_anonymizer_version": "1.0.13.post1",
-        "keep_private_tags": False,
-        "output_verification_enabled": True,
-        "overall_status": "failed" if "failed" in statuses.values() else "success",
-        "files": records,
-    }))
+    if summary:
+        (anon / "deidentification_summary.json").write_text(json.dumps({
+            "plugin_version": "1.2.0",
+            "upstream_dicom_anonymizer_version": "1.0.13.post1",
+            "keep_private_tags": False,
+            "copy_non_dicom": False,
+            "output_verification_enabled": True,
+            "stopped_early": False,
+            "overall_status": "failed" if "failed" in statuses.values() else "success",
+            "files": records,
+        }))
 
 
 @pytest.fixture
 def inputdir(tmp_path):
+    """Two patients, one with two series; one pixel-redaction sidecar."""
     root = tmp_path / "input"
-    ident = root / IDENT
+    orig = root / ORIG
     study = generate_uid()
     s1, s2 = generate_uid(), generate_uid()
-    common = dict(name="Doe^Jane", pid="MRN001", acc="ACC1", study=study)
-    make_dcm(ident / "Doe_Jane/s1/1.dcm", series=s1, **common)
-    make_dcm(ident / "Doe_Jane/s1/2.dcm", series=s1, **common)
-    make_dcm(ident / "Doe_Jane/s2/1.dcm", series=s2, **common)
-    make_dcm(ident / "Roe_Rick/s1/1.dcm", name="Roe^Rick", pid="MRN002", acc="ACC2",
-             study=generate_uid(), series=generate_uid(), birth="19700505",
-             study_date="20240410")
+    make_dcm(orig / "p01/s1/1.dcm", study=study, series=s1)
+    make_dcm(orig / "p01/s1/2.dcm", study=study, series=s1)
+    make_dcm(orig / "p01/s2/1.dcm", study=study, series=s2)
+    make_dcm(orig / "p02/s1/1.dcm", name="Roe^Rick", pid="MRN002", acc="ACC2",
+             birth="19700505", study_date="20240410")
     # pl-dicom_pixel_redact --save-bboxes sidecar for one file
-    (ident / "Doe_Jane/s1/2.json").write_text(json.dumps([
+    (orig / "p01/s1/2.json").write_text(json.dumps([
         {"entity_type": "PERSON", "score": 0.85, "left": 1, "top": 1, "width": 4, "height": 2},
         {"entity_type": "DATE_TIME", "score": 0.6, "left": 1, "top": 5, "width": 4, "height": 2},
     ]))
     return root
+
+
+@pytest.fixture
+def anonymized(inputdir):
+    """inputdir with a clean anonymized tree next to the original."""
+    anonymize_tree(inputdir / ORIG, inputdir / ANON)
+    return inputdir
 
 
 @pytest.fixture
@@ -125,12 +148,12 @@ def outdir(tmp_path):
 @pytest.fixture
 def options():
     return Namespace(
-        identifiedDir="",
+        originalDir="",
         anonymizedDir="",
         acknowledgeRetainedTags="",
         residualMinLength=3,
         skipPixelCheck=False,
-        reportOnly=False,
+        failOnLeak=True,
     )
 
 
@@ -146,3 +169,7 @@ def rewrite(path: Path, fn):
     ds = pydicom.dcmread(str(path))
     fn(ds)
     ds.save_as(str(path), write_like_original=False)
+
+
+def codes(outdir: Path) -> set:
+    return {f["code"] for f in summary(outdir)["findings"]}

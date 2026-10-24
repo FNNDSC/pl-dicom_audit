@@ -1,24 +1,30 @@
 #!/usr/bin/env python
 """
-pl-dicom_audit: build a de-identification audit by diffing the identified
-DICOM tree (pl-dicom_pixel_redact output: clean pixels, original headers)
-against the de-identified tree (pl-dicom_anonymize output).
+pl-dicom_audit: an audit record of what pl-dicom_anonymize changed.
+
+pl-dicom_anonymize writes only a status summary; it keeps no record of the
+old-to-new identifiers, UIDs or dates. This plugin pairs every original
+DICOM with its anonymized counterpart (same relative path), compares the
+two headers with pydicom, scans the anonymized output for leaked original
+values, and writes the result, stored separately from the de-identified
+data.
 
 Output layout (outputdir):
 
-    audit_summary.json        PHI-free: counts, checks, findings, file hashes
-    restricted/               PHI: crosswalks and the per-file change log
+    audit_summary.json        no PHI: counts, findings, path hashes, file hashes
+    restricted/               PHI: crosswalks, leaks and the per-file change log
         README.txt
         patients.csv
         accessions.csv
         uids.csv
         dates.csv
+        leaks.csv
         pixel_redactions.csv
         file_audit.jsonl
 
-stdout/stderr never contain PHI or relative paths (hashes only).
+stdout/stderr never contain PHI, identifiers or relative paths: only counts,
+finding codes and 12-character path hashes.
 """
-
 
 import csv
 import hashlib
@@ -27,15 +33,20 @@ import sys
 import time
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser, Namespace
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import pydicom
 from chris_plugin import chris_plugin
 
 from audit_engine import (
+    WATCHED_KEYWORDS,
     Crosswalk,
+    UID_NEEDLE_KEYWORDS,
+    NeedleIndex,
     diff_file,
-    find_residual_phi,
+    find_residual_phi_in_file,
     is_dicom_file,
     phi_needles,
     pixel_integrity,
@@ -43,11 +54,19 @@ from audit_engine import (
     read_redaction_sidecar,
     relpath_hash,
     sanitize_exception,
+    uid_needles,
 )
 
-__version__ = '0.1.0'
+__version__ = '0.2.0'
 
 ANONYMIZER_SUMMARY = "deidentification_summary.json"
+
+#: Non-DICOM files in the anonymized tree larger than this are scanned only
+#: up to this many bytes (and flagged as partially scanned).
+NON_DICOM_SCAN_LIMIT = 64 * 1024 * 1024
+
+#: Source keywords that mark a needle as an original instance UID.
+UID_SOURCES = frozenset(UID_NEEDLE_KEYWORDS) | {"MediaStorageSOPInstanceUID"}
 
 DISPLAY_TITLE = r"""
        _           _ _                                  _ _ _
@@ -62,53 +81,54 @@ DISPLAY_TITLE = r"""
 
 parser = ArgumentParser(
     description=(
-        "Audit DICOM de-identification: diff identified headers against "
-        "de-identified headers and emit crosswalk tables, a per-file change "
-        "log, and a PHI-free summary."
+        "Audit what pl-dicom_anonymize changed: pair each original DICOM with "
+        "its anonymized counterpart, record every header change and the "
+        "identifier, UID and date mappings, and scan the anonymized output "
+        "for leaked original values."
     ),
     formatter_class=ArgumentDefaultsHelpFormatter,
 )
 parser.add_argument('-V', '--version', action='version', version=f'%(prog)s {__version__}')
 parser.add_argument(
-    '--identifiedDir', default='', metavar='SUBDIR',
+    '--originalDir', default='', metavar='SUBDIR',
     help=(
-        "Subdirectory of inputdir holding the identified tree (pl-dicom_pixel_redact "
-        "output). Default: auto-detect -- the one top-level subdirectory that does "
-        "not contain the de-identified tree."
+        "Subdirectory of inputdir holding the original (pre-anonymization) tree. "
+        "Default: auto-detect -- the one top-level subdirectory that is not the "
+        "anonymized tree."
     ),
 )
 parser.add_argument(
     '--anonymizedDir', default='', metavar='SUBDIR',
     help=(
-        "Subdirectory of inputdir holding the de-identified tree (pl-dicom_anonymize "
+        "Subdirectory of inputdir holding the anonymized tree (pl-dicom_anonymize "
         f"output). Default: auto-detect -- the directory containing {ANONYMIZER_SUMMARY}."
     ),
 )
 parser.add_argument(
     '--acknowledgeRetainedTags', default='', metavar='TAG[,TAG...]',
     help=(
-        "Comma-separated DICOM keywords intentionally kept by the anonymization "
-        "policy; the residual-PHI scan ignores matches inside these elements. Use "
-        "the same value given to pl-dicom_anonymize."
+        "Comma-separated DICOM keywords the anonymization policy keeps on purpose; "
+        "the leak scan ignores matches inside these elements. Use the same value "
+        "given to pl-dicom_anonymize."
     ),
 )
 parser.add_argument(
     '--residualMinLength', type=int, default=3,
-    help="Minimum length of an identifying token searched for by the residual-PHI scan.",
+    help="Shortest original value (or name component) the leak scan searches for.",
 )
 parser.add_argument(
     '--skipPixelCheck', action='store_true', default=False,
-    help=(
-        "Do not compare PixelData between the trees. By default the plugin confirms "
-        "the header stage left the redacted pixels byte-identical."
-    ),
+    help="Do not check that PixelData is byte-identical between the two trees.",
 )
 parser.add_argument(
-    '--reportOnly', action='store_true', default=False,
+    '--failOnLeak', action='store_true', default=False,
     help=(
-        "Always exit 0 once the audit is written. By default the plugin exits 1 on "
-        "residual PHI, UID mapping conflicts, pixel mismatches, or unreadable/missing "
-        "pairs, so a pipeline stops on an audit failure."
+        "Exit 1 if the audit finds a leak (original values in the anonymized "
+        "headers, UIDs, paths or non-DICOM files), incomplete pairing (any original "
+        "DICOM without a verified anonymized counterpart, or the reverse), or an "
+        "integrity error (pixel mismatch, conflicting UID mapping). The audit is "
+        "always written first. Without this flag the plugin exits 0 and the result "
+        "is in audit_summary.json (overall_status)."
     ),
 )
 
@@ -121,7 +141,7 @@ class LayoutError(Exception):
     pass
 
 
-def locate_trees(inputdir: Path, identified_opt: str, anonymized_opt: str) -> tuple[Path, Path]:
+def locate_trees(inputdir: Path, original_opt: str, anonymized_opt: str) -> tuple[Path, Path]:
     if anonymized_opt:
         anon = (inputdir / anonymized_opt).resolve()
     else:
@@ -129,20 +149,20 @@ def locate_trees(inputdir: Path, identified_opt: str, anonymized_opt: str) -> tu
         if len(found) != 1:
             raise LayoutError(
                 f"expected exactly one {ANONYMIZER_SUMMARY} under inputdir to locate the "
-                f"de-identified tree, found {len(found)}; pass --anonymizedDir"
+                f"anonymized tree, found {len(found)}; pass --anonymizedDir"
             )
         anon = found[0].resolve()
 
     root = inputdir.resolve()
     if anon == root:
         raise LayoutError(
-            "the de-identified tree is inputdir itself, so the identified tree cannot "
-            "be separated from it. Join the two parent nodes with pl-topologicalcopy "
+            "the anonymized tree is inputdir itself, so the original tree cannot be "
+            "separated from it. Join the two parent nodes with pl-topologicalcopy "
             "using --groupByInstance so each lands in its own subdirectory."
         )
 
-    if identified_opt:
-        ident = (inputdir / identified_opt).resolve()
+    if original_opt:
+        orig = (inputdir / original_opt).resolve()
     else:
         candidates = [
             d.resolve() for d in sorted(inputdir.iterdir())
@@ -150,110 +170,214 @@ def locate_trees(inputdir: Path, identified_opt: str, anonymized_opt: str) -> tu
         ]
         if len(candidates) != 1:
             raise LayoutError(
-                f"expected exactly one top-level subdirectory besides the de-identified "
-                f"tree, found {len(candidates)}; pass --identifiedDir"
+                f"expected exactly one top-level subdirectory besides the anonymized "
+                f"tree, found {len(candidates)}; pass --originalDir"
             )
-        ident = candidates[0]
+        orig = candidates[0]
 
-    for label, d in (("identified", ident), ("de-identified", anon)):
+    for label, d in (("original", orig), ("anonymized", anon)):
         if not d.is_dir():
             raise LayoutError(f"{label} tree directory does not exist")
-    if ident == anon or ident in anon.parents or anon in ident.parents:
-        raise LayoutError("identified and de-identified trees must not overlap")
-    return ident, anon
+    if orig == anon or orig in anon.parents or anon in orig.parents:
+        raise LayoutError("original and anonymized trees must not overlap")
+    return orig, anon
 
 
 # --------------------------------------------------------------------------
-# Work list
+# Inventory: every file in both trees, and what the anonymizer said
 # --------------------------------------------------------------------------
 
-def build_worklist(ident: Path, anon: Path) -> tuple[list[tuple[str, str]], dict]:
-    """
-    Return ([(relpath, anonymizer_status)], anonymizer_summary_or_empty).
+#: status -> category. "pairing" statuses make the pairing incomplete.
+STATUS_CATEGORY = {
+    "audited": "ok",
+    "not_dicom": "info",                    # non-DICOM original, not passed through
+    "redaction_sidecar": "info",            # pl-dicom_pixel_redact bounding-box JSON
+    "non_dicom_copied": "warning",          # non-DICOM passed through unexamined (--copyNonDicom)
+    "extra_anonymized_file": "warning",     # non-DICOM in anonymized tree with no original
+    "failed_deidentification": "pairing",   # anonymizer reported failure
+    "not_deidentified": "pairing",          # original DICOM the anonymizer never processed
+    "missing_anonymized": "pairing",        # anonymizer says processed; no output file
+    "missing_original": "pairing",          # anonymizer lists a path absent from the original tree
+    "unmatched_anonymized": "pairing",      # anonymized DICOM with no original
+    "anonymized_not_dicom": "pairing",      # original DICOM, but the output is not DICOM
+    "unreadable": "pairing",                # either side could not be parsed as DICOM
+}
 
-    The anonymizer's own summary is authoritative for which files it
-    attempted. Identified DICOMs it never saw, and de-identified DICOMs it
-    does not list, are added as their own categories so nothing is silently
-    left out of the audit.
+
+@dataclass
+class Entry:
+    rel: str
+    orig_kind: Optional[str] = None         # "dicom" | "other" | None (absent)
+    anon_kind: Optional[str] = None
+    anonymizer_status: Optional[str] = None  # from deidentification_summary.json
+
+
+def _kind(path: Path) -> str:
+    return "dicom" if is_dicom_file(path) else "other"
+
+
+def build_inventory(orig: Path, anon: Path) -> tuple[list[Entry], dict]:
     """
-    summary_path = anon / ANONYMIZER_SUMMARY
+    One Entry per relative path found in either tree or in the anonymizer's
+    summary, so every input file is accounted for.
+    """
     summary: dict = {}
-    work: dict[str, str] = {}
-    if summary_path.is_file():
-        summary = json.loads(summary_path.read_text())
-        for rec in summary.get("files", []):
-            work[str(rec["path"])] = str(rec.get("status", "unknown"))
+    entries: dict[str, Entry] = {}
 
-    for f in sorted(p for p in ident.rglob("*") if p.is_file()):
-        rel = str(f.relative_to(ident))
-        if rel not in work and is_dicom_file(f):
-            work[rel] = "not_seen_by_anonymizer"
+    def entry(rel: str) -> Entry:
+        return entries.setdefault(rel, Entry(rel))
+
+    for f in sorted(p for p in orig.rglob("*") if p.is_file()):
+        entry(str(f.relative_to(orig))).orig_kind = _kind(f)
 
     for f in sorted(p for p in anon.rglob("*") if p.is_file()):
         rel = str(f.relative_to(anon))
-        if rel in work or not is_dicom_file(f):
+        if rel == ANONYMIZER_SUMMARY:
             continue
-        # With no anonymizer summary (e.g. --anonymizedDir pointing at a tree
-        # from another tool) every de-identified DICOM is treated as processed.
-        work[rel] = "processed" if not summary else "unlisted_in_anonymizer_summary"
+        entry(rel).anon_kind = _kind(f)
 
-    return sorted(work.items()), summary
+    summary_path = anon / ANONYMIZER_SUMMARY
+    if summary_path.is_file():
+        summary = json.loads(summary_path.read_text())
+        for rec in summary.get("files", []):
+            entry(str(rec["path"])).anonymizer_status = str(rec.get("status", "unknown"))
+
+    return [entries[k] for k in sorted(entries)], summary
+
+
+def classify(e: Entry, sidecars: set) -> str:
+    """Status for one inventory entry; "pair" means audit it."""
+    if e.orig_kind == "dicom":
+        if e.anonymizer_status == "failed":
+            return "failed_deidentification"
+        if e.anon_kind == "dicom":
+            return "pair"
+        if e.anon_kind == "other":
+            return "anonymized_not_dicom"
+        if e.anonymizer_status == "processed":
+            return "missing_anonymized"
+        return "not_deidentified"
+
+    if e.orig_kind == "other":
+        if e.rel in sidecars:
+            return "redaction_sidecar"
+        if e.anon_kind == "dicom":
+            return "unmatched_anonymized"
+        if e.anon_kind == "other":
+            return "non_dicom_copied"
+        return "not_dicom"
+
+    # absent from the original tree
+    if e.anon_kind == "dicom":
+        return "unmatched_anonymized"
+    if e.anon_kind == "other":
+        return "extra_anonymized_file"
+    return "missing_original"        # only the anonymizer summary mentions it
 
 
 # --------------------------------------------------------------------------
-# Per-file audit
+# Per-pair audit
 # --------------------------------------------------------------------------
 
-def audit_one(rel: str, anon_status: str, ident: Path, anon: Path, xwalk: Crosswalk,
-              options: Namespace) -> dict:
-    ip, ap = ident / rel, anon / rel
-    rec: dict = {"path": rel, "path_hash": relpath_hash(rel), "anonymizer_status": anon_status}
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-    if anon_status in ("skipped_not_dicom", "copied_non_dicom"):
-        rec["status"] = "not_dicom"
-        return rec
-    if anon_status == "failed":
-        rec["status"] = "failed_deidentification"
-        rec["pixel_redaction"] = read_redaction_sidecar(ip) if ip.is_file() else None
-        return rec
-    if anon_status == "not_seen_by_anonymizer":
-        rec["status"] = "not_deidentified"
-        return rec
-    if not ip.is_file():
-        rec["status"] = "missing_identified"
-        return rec
-    if not ap.is_file():
-        rec["status"] = "missing_deidentified"
-        return rec
 
+def collect_ui_values(ds, prefix="") -> list[tuple[str, str]]:
+    """[(element path, UID value)] for every UI element, recursing."""
+    out = []
+    for elem in ds:
+        name = elem.keyword or f"({elem.tag.group:04X},{elem.tag.element:04X})"
+        if elem.VR == "SQ":
+            for i, item in enumerate(elem.value or []):
+                out.extend(collect_ui_values(item, f"{prefix}{name}[{i}]."))
+        elif elem.VR == "UI" and elem.value:
+            vals = elem.value if isinstance(elem.value, (list, tuple)) else [elem.value]
+            out.extend((prefix + name, str(v).rstrip("\x00 ")) for v in vals if v)
+    return out
+
+
+def audit_pair(e: Entry, orig: Path, anon: Path, xwalk: Crosswalk, needles: NeedleIndex,
+               options: Namespace) -> tuple[dict, list[tuple[str, str]]]:
+    """Return (record, anonymized UI values) for one original/anonymized pair."""
+    ip, ap = orig / e.rel, anon / e.rel
+    rec: dict = {}
     try:
         ids = read_dicom(ip)
         dds = read_dicom(ap)
-    except Exception as e:  # noqa: BLE001
-        cls, summary = sanitize_exception(e)
-        rec.update(status="error", error_class=cls, error_summary=summary)
-        return rec
+    except Exception as ex:  # noqa: BLE001
+        cls, summary = sanitize_exception(ex)
+        rec.update(status="unreadable", error_class=cls, error_summary=summary)
+        return rec, []
 
     try:
         changes = diff_file(ids, dds)
-        residual = find_residual_phi(
-            dds, phi_needles(ids, options.residualMinLength), options.acknowledged_tags_set
-        )
-        xwalk.add_file(rel, ids, dds, changes)
-    except Exception as e:  # noqa: BLE001
-        cls, summary = sanitize_exception(e)
-        rec.update(status="error", error_class=cls, error_summary=summary)
-        return rec
+        leaks = find_residual_phi_in_file(
+            dds, ids, options.residualMinLength, options.acknowledged_tags_set)
+        xwalk.add_file(e.rel, ids, dds, changes)
+        needles.add(phi_needles(ids, options.residualMinLength))
+        needles.add(uid_needles(ids))
+        ui_values = collect_ui_values(getattr(dds, "file_meta", None) or [], "file_meta.")
+        ui_values += collect_ui_values(dds)
+    except Exception as ex:  # noqa: BLE001
+        cls, summary = sanitize_exception(ex)
+        rec.update(status="unreadable", error_class=cls, error_summary=summary)
+        return rec, []
+
+    actions = Counter(c.action for c in changes)
     rec.update(
-        status="audited" if anon_status == "processed" else anon_status,
+        status="audited",
         patient_key=xwalk.patient_key(ids),
+        original_sha256=file_sha256(ip),
+        anonymized_sha256=file_sha256(ap),
+        action_counts=dict(sorted(actions.items())),
+        identifying_retained=sorted({c.keyword for c in changes
+                                     if c.action == "retained" and c.keyword in WATCHED_KEYWORDS}),
         changes=[c.as_dict() for c in changes],
-        action_counts=dict(Counter(c.action for c in changes)),
-        residual_phi=residual,
+        leaks=leaks,
         pixel_integrity=None if options.skipPixelCheck else pixel_integrity(ids, dds),
         pixel_redaction=read_redaction_sidecar(ip),
     )
-    return rec
+    return rec, ui_values
+
+
+# --------------------------------------------------------------------------
+# Whole-tree leak scans: paths and non-DICOM files
+# --------------------------------------------------------------------------
+
+def scan_anonymized_tree(anon: Path, needles: NeedleIndex) -> tuple[list[dict], Counter]:
+    """
+    Search the anonymized tree's relative paths, and the contents of every
+    non-DICOM file in it (including the anonymizer's own summary), for any
+    original value seen anywhere in the run.
+    """
+    rows: list[dict] = []
+    stats: Counter = Counter()
+    for f in sorted(p for p in anon.rglob("*") if p.is_file()):
+        rel = str(f.relative_to(anon))
+        for token, src in needles.search(rel):
+            rows.append({"file": rel, "location": "<path>", "kind": "path",
+                         "source_keyword": src, "matched": token, "occurrences": 1})
+        if is_dicom_file(f):
+            continue
+        stats["non_dicom_scanned"] += 1
+        try:
+            with open(f, "rb") as fh:
+                data = fh.read(NON_DICOM_SCAN_LIMIT + 1)
+        except OSError:
+            stats["non_dicom_unreadable"] += 1
+            continue
+        if len(data) > NON_DICOM_SCAN_LIMIT:
+            stats["non_dicom_truncated"] += 1
+            data = data[:NON_DICOM_SCAN_LIMIT]
+        for token, src in needles.search(data.decode("latin-1")):
+            rows.append({"file": rel, "location": "<content>", "kind": "non_dicom_content",
+                         "source_keyword": src, "matched": token, "occurrences": 1})
+    return rows, stats
 
 
 # --------------------------------------------------------------------------
@@ -263,22 +387,29 @@ def audit_one(rel: str, anon_status: str, ident: Path, anon: Path, xwalk: Crossw
 RESTRICTED_README = """\
 THIS DIRECTORY CONTAINS PROTECTED HEALTH INFORMATION.
 
-It holds the re-identification key for a de-identified DICOM dataset:
-original patient names and IDs, accession numbers, UIDs and dates, mapped
-to their de-identified values. Anyone with this directory and the
-de-identified dataset can re-identify every patient.
+It is the re-identification key for an anonymized DICOM dataset: original
+patient names and IDs, accession numbers, UIDs and dates, mapped to their
+anonymized values. Anyone with this directory and the anonymized dataset
+can re-identify every patient.
 
-Store it under the same (or stricter) access controls as the original,
-identified data, and never alongside the de-identified dataset.
+Keep it under the same (or stricter) access controls as the original data,
+never alongside the anonymized dataset, and delete it when your retention
+policy says so. See the pl-dicom_audit README, "Sensitivity and access
+control".
 
 Files:
-  patients.csv          original -> de-identified patient identity, date handling
-  accessions.csv        original -> de-identified accession numbers
-  uids.csv              original -> de-identified Study/Series/SOP/FoR UIDs
+  patients.csv          original -> anonymized PatientID / PatientName, date handling
+  accessions.csv        original -> anonymized AccessionNumber
+  uids.csv              original -> anonymized Study/Series/SOP/FoR UIDs
   dates.csv             every date/time element: original, new, action, offset
-  pixel_redactions.csv  pixel-stage redaction record per file
-  file_audit.jsonl      one JSON record per file: every header change
+  leaks.csv             every original value found in the anonymized output
+  pixel_redactions.csv  pixel-stage redaction record per file (if available)
+  file_audit.jsonl      one record per file in either tree: status and, for
+                        audited pairs, every element changed, removed,
+                        added or retained, with before and after values
 """
+
+LEAK_FIELDS = ["file", "location", "kind", "source_keyword", "matched", "occurrences"]
 
 
 def write_csv(path: Path, rows, fieldnames: list[str]) -> int:
@@ -292,21 +423,13 @@ def write_csv(path: Path, rows, fieldnames: list[str]) -> int:
     return n
 
 
-def file_sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 
 @chris_plugin(
     parser=parser,
-    title='DICOM de-identification audit',
+    title='DICOM anonymization audit',
     category='DICOM De-identification',
     min_memory_limit='500Mi',
     min_cpu_limit='1000m',
@@ -322,13 +445,13 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
         parser.error("--residualMinLength must be at least 1")
 
     try:
-        ident, anon = locate_trees(inputdir, options.identifiedDir, options.anonymizedDir)
-        worklist, anon_summary = build_worklist(ident, anon)
-    except LayoutError as e:
-        print(f"FATAL: {e}", file=sys.stderr)
+        orig, anon = locate_trees(inputdir, options.originalDir, options.anonymizedDir)
+        inventory, anon_summary = build_inventory(orig, anon)
+    except LayoutError as ex:
+        print(f"FATAL: {ex}", file=sys.stderr)
         sys.exit(2)
-    except Exception as e:  # noqa: BLE001
-        cls, summary = sanitize_exception(e)
+    except Exception as ex:  # noqa: BLE001
+        cls, summary = sanitize_exception(ex)
         print(f"FATAL: could not read input layout ({cls}): {summary}", file=sys.stderr)
         sys.exit(2)
 
@@ -336,29 +459,61 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
     restricted.mkdir(parents=True, exist_ok=True)
     (restricted / "README.txt").write_text(RESTRICTED_README)
 
+    sidecars = {str(Path(e.rel).with_suffix(".json")) for e in inventory if e.orig_kind == "dicom"}
+    has_summary = bool(anon_summary)
+
     xwalk = Crosswalk()
+    needles = NeedleIndex()
     status_counts: Counter = Counter()
     action_counts: Counter = Counter()
+    retained_identifying: Counter = Counter()
     pixel_counts: Counter = Counter()
     redaction_counts: Counter = Counter()
     entity_counts: Counter = Counter()
-    residual_by_keyword: Counter = Counter()
-    residual_files: list[str] = []
+    leak_by_keyword: Counter = Counter()
+    leak_rows: list[dict] = []
+    leak_file_hashes: set = set()
+    header_leak_files = 0
+    reported_uid_leaks: set = set()
+    anon_ui: dict[str, list] = {}           # anonymized UI value -> [count, rel, element path]
     pixel_mismatch_files: list[str] = []
-    error_files: list[str] = []
+    unlisted: list[str] = []
     total_boxes = 0
     redaction_rows: list[dict] = []
+    file_index: list[dict] = []
 
     with open(restricted / "file_audit.jsonl", "w") as log:
-        for i, (rel, anon_status) in enumerate(worklist, 1):
-            rec = audit_one(rel, anon_status, ident, anon, xwalk, options)
-            log.write(json.dumps(rec, default=str) + "\n")
-            h, st = rec["path_hash"], rec["status"]
-            status_counts[st] += 1
-            action_counts.update(rec.get("action_counts", {}))
+        for i, e in enumerate(inventory, 1):
+            h = relpath_hash(e.rel)
+            rec: dict = {
+                "path": e.rel, "path_hash": h,
+                "original": e.orig_kind, "anonymized": e.anon_kind,
+                "anonymizer_status": e.anonymizer_status,
+            }
+            st = classify(e, sidecars)
+            if st == "pair":
+                result, ui_values = audit_pair(e, orig, anon, xwalk, needles, options)
+                rec.update(result)
+                st = rec["status"]
+                if st == "audited" and has_summary and e.anonymizer_status is None:
+                    rec["unlisted_in_anonymizer_summary"] = True
+                    unlisted.append(h)
+                for path, v in ui_values:
+                    slot = anon_ui.setdefault(v, [0, e.rel, path])
+                    slot[0] += 1
+            else:
+                rec["status"] = st
+                if st == "failed_deidentification" and (orig / e.rel).is_file():
+                    rec["pixel_redaction"] = read_redaction_sidecar(orig / e.rel)
 
-            if st in ("error", "missing_deidentified", "missing_identified"):
-                error_files.append(h)
+            log.write(json.dumps(rec, default=str) + "\n")
+            status_counts[st] += 1
+            file_index.append({"path_hash": h, "status": st,
+                               **({"anonymized_sha256": rec["anonymized_sha256"]}
+                                  if "anonymized_sha256" in rec else {})})
+            action_counts.update(rec.get("action_counts", {}))
+            retained_identifying.update(rec.get("identifying_retained", []))
+
             pi = rec.get("pixel_integrity")
             if pi:
                 pixel_counts[pi] += 1
@@ -370,39 +525,65 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
                 entity_counts.update(pr.get("entity_types", {}))
                 total_boxes += pr.get("boxes", 0)
                 redaction_rows.append({
-                    "file": rel, "status": pr["status"], "boxes": pr.get("boxes", 0),
+                    "file": e.rel, "status": pr["status"], "boxes": pr.get("boxes", 0),
                     "entity_types": ";".join(f"{k}={v}" for k, v in pr.get("entity_types", {}).items()),
                     "min_score": pr.get("min_score", ""), "max_score": pr.get("max_score", ""),
                     "pixel_integrity": rec.get("pixel_integrity") or "",
                 })
-            if rec.get("residual_phi"):
-                residual_files.append(h)
-                residual_by_keyword.update(hit["keyword"] for hit in rec["residual_phi"])
+            if rec.get("leaks"):
+                header_leak_files += 1
+                leak_file_hashes.add(h)
+                for hit in rec["leaks"]:
+                    leak_by_keyword[hit["keyword"]] += 1
+                    if hit["kind"] == "uid":
+                        reported_uid_leaks.add(hit["matched"])
+                    leak_rows.append({"file": e.rel, "location": hit["path"], "kind": hit["kind"],
+                                      "source_keyword": hit["source_keyword"],
+                                      "matched": hit["matched"], "occurrences": 1})
 
-            flag = {
-                "audited": "OK   ", "not_dicom": "SKIP ", "not_deidentified": "WARN ",
-                "failed_deidentification": "WARN ",
-            }.get(st, "FAIL ")
+            category = STATUS_CATEGORY.get(st, "pairing")
+            flag = {"ok": "OK   ", "info": "SKIP ", "warning": "WARN "}.get(category, "FAIL ")
             extra = ""
-            if rec.get("residual_phi"):
-                flag, extra = "FAIL ", f" residual PHI in {len(rec['residual_phi'])} element(s)"
+            if rec.get("leaks"):
+                flag, extra = "FAIL ", f" leak in {len(rec['leaks'])} element(s)"
             elif pi == "mismatch":
                 flag, extra = "FAIL ", " PixelData differs between trees"
             print(f"[{flag}] file#{i} ({h}): {st}{extra}", file=sys.stderr)
 
-    # -- crosswalk tables ----------------------------------------------------
+    # -- cross-file UID leaks: an original UID of ANY file, found anywhere --
+    leaked_uids = set(reported_uid_leaks)
+    for v, (count, rel, path) in sorted(anon_ui.items()):
+        if needles.tokens.get(v) not in UID_SOURCES or v in reported_uid_leaks:
+            continue
+        leaked_uids.add(v)
+        leak_file_hashes.add(relpath_hash(rel))
+        leak_rows.append({"file": rel, "location": path, "kind": "uid",
+                          "source_keyword": needles.tokens[v] + " (another file)",
+                          "matched": v, "occurrences": count})
+    uid_leak_values = len(leaked_uids)
+
+    # -- paths and non-DICOM files of the anonymized tree --------------------
+    tree_rows, tree_stats = scan_anonymized_tree(anon, needles)
+    leak_rows.extend(tree_rows)
+    path_leaks = sorted({r["file"] for r in tree_rows if r["kind"] == "path"})
+    content_leaks = sorted({r["file"] for r in tree_rows if r["kind"] == "non_dicom_content"})
+    for rel in path_leaks + content_leaks:
+        leak_file_hashes.add(relpath_hash(rel))
+
+    # -- restricted tables ---------------------------------------------------
     n_patients = write_csv(restricted / "patients.csv", xwalk.rows_patients(), [
-        "original_patient_id", "original_patient_name", "deidentified_patient_id",
-        "deidentified_patient_name", "pseudonym_consistent", "date_handling",
+        "original_patient_id", "original_patient_name", "anonymized_patient_id",
+        "anonymized_patient_name", "pseudonym_consistent", "date_handling",
         "date_offset_days", "date_offset_consistent", "n_studies", "n_files"])
     n_acc = write_csv(restricted / "accessions.csv", xwalk.rows_accessions(), [
-        "original_accession_number", "deidentified_accession_number",
+        "original_accession_number", "anonymized_accession_number",
         "original_patient_id", "original_study_instance_uid", "consistent"])
     uid_rows = list(xwalk.rows_uids())
     write_csv(restricted / "uids.csv", uid_rows, [
-        "level", "original_uid", "deidentified_uid", "occurrences", "consistent"])
+        "level", "original_uid", "anonymized_uid", "occurrences", "consistent"])
     write_csv(restricted / "dates.csv", xwalk.dates, [
         "patient_key", "file", "element", "vr", "original", "new", "action", "delta_days"])
+    write_csv(restricted / "leaks.csv", leak_rows, LEAK_FIELDS)
     write_csv(restricted / "pixel_redactions.csv", redaction_rows, [
         "file", "status", "boxes", "entity_types", "min_score", "max_score", "pixel_integrity"])
 
@@ -411,47 +592,69 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
     pseudo_inconsistent, pseudo_collisions = xwalk.pseudonym_findings()
     offsets = [xwalk.patient_date_handling(p) for p in xwalk.patients.values()]
     inconsistent_offsets = sum(1 for _, _, ok in offsets if not ok)
+    pairing = {s: n for s, n in status_counts.items() if STATUS_CATEGORY.get(s) == "pairing"}
+    sidecars_seen = sum(n for k, n in redaction_counts.items() if k != "no_sidecar")
 
     findings = []
 
-    def finding(code, severity, count, message):
+    def finding(code, category, severity, count, message, **extra):
         if count:
-            findings.append({"code": code, "severity": severity, "count": count, "message": message})
+            findings.append({"code": code, "category": category, "severity": severity,
+                             "count": count, "message": message, **extra})
 
-    finding("residual_phi", "error", len(residual_files),
-            "de-identified headers still contain values from the identified headers")
-    finding("pixel_mismatch", "error", len(pixel_mismatch_files),
-            "PixelData changed between the pixel-scrubbed and de-identified files")
-    finding("uid_one_to_many", "error", len(uid_one_to_many),
+    finding("residual_phi", "leak", "error", header_leak_files,
+            "anonymized headers contain values from the original headers")
+    finding("uid_leak", "leak", "error", uid_leak_values,
+            "original Study/Series/SOP/FoR UIDs appear in the anonymized output")
+    finding("phi_in_path", "leak", "error", len(path_leaks),
+            "anonymized file paths contain original values (pl-dicom_anonymize keeps "
+            "the input directory and file names)")
+    finding("phi_in_non_dicom", "leak", "error", len(content_leaks),
+            "non-DICOM files in the anonymized tree contain original values")
+    finding("incomplete_pairing", "pairing", "error", sum(pairing.values()),
+            "files without a verified original/anonymized pair", by_status=dict(sorted(pairing.items())))
+    finding("nothing_audited", "pairing", "error", int(status_counts["audited"] == 0),
+            "no original/anonymized DICOM pair was audited")
+    finding("pixel_mismatch", "integrity", "error", len(pixel_mismatch_files),
+            "PixelData differs between the original and anonymized files")
+    finding("uid_one_to_many", "integrity", "error", len(uid_one_to_many),
             "an original UID was mapped to more than one new UID")
-    finding("uid_many_to_one", "error", len(uid_many_to_one),
+    finding("uid_many_to_one", "integrity", "error", len(uid_many_to_one),
             "different original UIDs were mapped to the same new UID")
-    finding("unpaired_or_unreadable", "error", len(error_files),
-            "files listed as processed could not be paired or read")
-    finding("deidentification_failed", "warning", status_counts["failed_deidentification"],
-            "the anonymizer reported failures; those files are absent from the de-identified tree")
-    finding("not_deidentified", "warning", status_counts["not_deidentified"],
-            "identified DICOM files the anonymizer never examined (check its --pattern)")
-    finding("unlisted_deidentified", "warning", status_counts["unlisted_in_anonymizer_summary"],
-            "de-identified DICOM files not listed in the anonymizer summary")
-    finding("pseudonym_inconsistent", "warning", len(pseudo_inconsistent),
-            "a patient received more than one de-identified PatientID")
-    finding("pseudonym_collision", "warning", len(pseudo_collisions),
-            "different patients share one non-empty de-identified PatientID")
-    finding("uid_reference_emptied", "warning", sum(xwalk.broken_references.values()),
-            "UID references (Referenced*UID) were emptied or removed rather than remapped, "
-            "so those cross-object links no longer resolve")
-    finding("date_offset_inconsistent", "warning", inconsistent_offsets,
+    finding("non_dicom_copied", "coverage", "warning", status_counts["non_dicom_copied"],
+            "non-DICOM files passed through to the anonymized tree (contents scanned for "
+            "known values only)")
+    finding("extra_anonymized_file", "coverage", "warning", status_counts["extra_anonymized_file"],
+            "non-DICOM files in the anonymized tree with no original")
+    finding("unlisted_in_anonymizer_summary", "coverage", "warning", len(unlisted),
+            "anonymized DICOM files not listed in the anonymizer summary")
+    finding("non_dicom_partially_scanned", "coverage", "warning", tree_stats["non_dicom_truncated"]
+            + tree_stats["non_dicom_unreadable"],
+            f"non-DICOM files only partially scanned (over {NON_DICOM_SCAN_LIMIT} bytes) or unreadable")
+    finding("pseudonym_inconsistent", "consistency", "warning", len(pseudo_inconsistent),
+            "a patient received more than one anonymized PatientID")
+    finding("pseudonym_collision", "consistency", "warning", len(pseudo_collisions),
+            "different patients share one non-empty anonymized PatientID")
+    finding("uid_reference_emptied", "consistency", "warning", sum(xwalk.broken_references.values()),
+            "Referenced*UID elements were emptied or removed rather than remapped, so those "
+            "cross-object links no longer resolve")
+    finding("date_offset_inconsistent", "consistency", "warning", inconsistent_offsets,
             "a patient's dates were shifted by more than one offset")
-    finding("pixel_redaction_unrecorded", "info", redaction_counts["no_sidecar"],
-            "no bounding-box sidecar; run pl-dicom_pixel_redact with --save-bboxes to record redactions")
+    finding("dates_retained", "consistency", "warning", xwalk.date_actions["retained"],
+            "date/time elements kept their original values")
+    finding("not_dicom", "coverage", "info", status_counts["not_dicom"],
+            "non-DICOM files in the original tree (not anonymized, not passed through)")
+    finding("redaction_sidecar", "coverage", "info", status_counts["redaction_sidecar"],
+            "pl-dicom_pixel_redact bounding-box files in the original tree")
+    if sidecars_seen:
+        finding("pixel_redaction_unrecorded", "coverage", "info", redaction_counts["no_sidecar"],
+                "audited files with no bounding-box sidecar from pl-dicom_pixel_redact")
 
     failed = any(f["severity"] == "error" for f in findings)
 
     restricted_hashes = {
         p.name: file_sha256(p) for p in sorted(restricted.iterdir()) if p.is_file()
     }
-    uid_levels = Counter(r["level"] for r in uid_rows)
     summary = {
         "plugin": "pl-dicom_audit",
         "plugin_version": __version__,
@@ -459,21 +662,28 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "elapsed_seconds": round(time.time() - started, 3),
         "anonymizer": {
-            "summary_found": bool(anon_summary),
+            "summary_found": has_summary,
             "plugin_version": anon_summary.get("plugin_version"),
             "upstream_version": anon_summary.get("upstream_dicom_anonymizer_version"),
             "overall_status": anon_summary.get("overall_status"),
             "keep_private_tags": anon_summary.get("keep_private_tags"),
+            "copy_non_dicom": anon_summary.get("copy_non_dicom"),
             "output_verification_enabled": anon_summary.get("output_verification_enabled"),
+            "stopped_early": anon_summary.get("stopped_early"),
         },
         "options": {
             "acknowledged_retained_tags": sorted(options.acknowledged_tags_set),
             "residual_min_length": options.residualMinLength,
             "pixel_check": not options.skipPixelCheck,
-            "report_only": bool(options.reportOnly),
+            "fail_on_leak": bool(options.failOnLeak),
         },
-        "files": {"total": len(worklist), "by_status": dict(sorted(status_counts.items()))},
+        "files": {
+            "total": len(inventory),
+            "by_status": dict(sorted(status_counts.items())),
+            "pairing_complete": not pairing and status_counts["audited"] > 0,
+        },
         "header_changes": dict(sorted(action_counts.items())),
+        "identifying_elements_retained": dict(sorted(retained_identifying.items())),
         "patients": {
             "count": n_patients,
             "pseudonym_inconsistent": len(pseudo_inconsistent),
@@ -483,40 +693,46 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
         "accessions": n_acc,
         "uids": {
             "mapped": len(uid_rows),
-            "by_level": dict(sorted(uid_levels.items())),
+            "by_level": dict(sorted(Counter(r["level"] for r in uid_rows).items())),
             "references_emptied": dict(sorted(xwalk.broken_references.items())),
             "one_to_many": len(uid_one_to_many),
             "many_to_one": len(uid_many_to_one),
         },
         "dates": dict(sorted(xwalk.date_actions.items())),
-        "residual_phi": {
-            "files": len(residual_files),
-            "by_keyword": dict(sorted(residual_by_keyword.items())),
-            "file_hashes": residual_files,
+        "leaks": {
+            "header_files": header_leak_files,
+            "header_by_keyword": dict(sorted(leak_by_keyword.items())),
+            "uid_values": uid_leak_values,
+            "paths": len(path_leaks),
+            "non_dicom_files": len(content_leaks),
+            "non_dicom_scanned": tree_stats["non_dicom_scanned"],
+            "file_hashes": sorted(leak_file_hashes),
         },
         "pixels": {
             "integrity": dict(sorted(pixel_counts.items())),
             "mismatch_file_hashes": pixel_mismatch_files,
-            "redaction": dict(sorted(redaction_counts.items())),
+            "redaction": dict(sorted(redaction_counts.items())) if sidecars_seen else {},
             "boxes": total_boxes,
             "entity_types": dict(sorted(entity_counts.items())),
         },
         "findings": findings,
         "overall_status": "fail" if failed else "pass",
+        "file_index": file_index,
         "restricted_files_sha256": restricted_hashes,
     }
     (outputdir / "audit_summary.json").write_text(json.dumps(summary, indent=2))
 
     print("---", file=sys.stderr)
-    print(f"files={len(worklist)} " + " ".join(f"{k}={v}" for k, v in sorted(status_counts.items())),
+    print(f"files={len(inventory)} " + " ".join(f"{k}={v}" for k, v in sorted(status_counts.items())),
           file=sys.stderr)
-    print(f"patients={n_patients} accessions={n_acc} uids={len(uid_rows)}", file=sys.stderr)
+    print(f"patients={n_patients} accessions={n_acc} uids={len(uid_rows)} "
+          f"leak_rows={len(leak_rows)}", file=sys.stderr)
     for f in findings:
         print(f"{f['severity'].upper()}: {f['code']} ({f['count']}): {f['message']}", file=sys.stderr)
     print(f"Audit {summary['overall_status'].upper()}. PHI-bearing tables are in restricted/.",
           file=sys.stderr)
 
-    if failed and not options.reportOnly:
+    if failed and options.failOnLeak:
         sys.exit(1)
 
 

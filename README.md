@@ -1,249 +1,468 @@
-# A ChRIS plugin to audit DICOM de-identification
+# A ChRIS plugin to audit DICOM anonymization
 
 [![Version](https://img.shields.io/docker/v/fnndsc/pl-dicom_audit?sort=semver)](https://hub.docker.com/r/fnndsc/pl-dicom_audit)
 [![MIT License](https://img.shields.io/github/license/fnndsc/pl-dicom_audit)](https://github.com/FNNDSC/pl-dicom_audit/blob/main/LICENSE)
 [![ci](https://github.com/FNNDSC/pl-dicom_audit/actions/workflows/ci.yml/badge.svg)](https://github.com/FNNDSC/pl-dicom_audit/actions/workflows/ci.yml)
 
-`pl-dicom_audit` is a **ChRIS ds plugin**. It is the last stage of the
-FNNDSC DICOM de-identification pipeline. It compares each identified header
-with its de-identified counterpart and writes three things: the
-re-identification crosswalk, a per-file change log, and a PHI-free summary
-whose pass/fail status can gate the pipeline.
+`pl-dicom_audit` is a **ChRIS ds plugin** that records what
+[pl-dicom_anonymize](https://github.com/FNNDSC/pl-dicom_anonymize) changed.
+
+pl-dicom_anonymize writes only a status summary
+(`deidentification_summary.json`). It keeps no record of which original
+identifier became which pseudonym, which UID became which, or what happened to
+each date: the upstream engine holds its UID map in memory and discards it when
+the process exits. This plugin rebuilds that record from the data itself. It
+pairs every original DICOM with its anonymized counterpart, compares the two
+with pydicom, and writes:
+
+* **what changed in each file**: every element changed, removed, added or
+  retained, with before and after values;
+* **the mappings**: PatientID/PatientName, Study/Series/SOP Instance UIDs,
+  accession numbers, and every date/time element;
+* **leaks**: original values found anywhere in the anonymized output;
+* **an account of every file**: unmatched, skipped, failed and non-DICOM files
+  are all listed, so nothing in either tree is silently left out.
+
+The PHI-bearing part of the result goes into a separate `restricted/`
+directory. A PHI-free summary sits next to it, and the job log contains only
+counts and hashes.
+
+## Contents
+
+* [Where it sits in a pipeline](#where-it-sits-in-a-pipeline)
+* [Inputs](#inputs)
+* [Outputs](#outputs)
+* [Leak scan](#leak-scan)
+* [File accounting](#file-accounting)
+* [Findings and exit status](#findings-and-exit-status)
+* [Options](#options)
+* [Usage](#usage)
+* [Sensitivity and access control](#sensitivity-and-access-control)
+* [Log hygiene](#log-hygiene)
+* [Limitations](#limitations)
+* [Development and testing](#development-and-testing)
+
+## Where it sits in a pipeline
 
 ```
-Raw DICOM ──► pl-dicom_pixel_redact ──┬──► pl-dicom_anonymize ──┐
-              (clean pixels,          │    (clean headers)      │
-               identified headers)    │                         │
-                                      └──────────┬──────────────┘
-                                                 ▼
-                              pl-topologicalcopy --groupByInstance
-                                                 ▼
-                                          pl-dicom_audit
-                                                 ▼
-                         audit_summary.json  +  restricted/ (PHI)
+original DICOM node ──┬──► pl-dicom_anonymize ──┐
+ (e.g. pl-dircopy, or │                         │
+  pl-dicom_pixel_     └───────────┬─────────────┘
+  redact output)                  ▼
+                 pl-topologicalcopy --groupByInstance
+                                  ▼
+                           pl-dicom_audit
+                                  ▼
+              audit_summary.json  +  restricted/ (PHI)
 ```
 
-## How it works: diffing two trees
+The "original" side is whatever pl-dicom_anonymize read. That's usually the raw
+upload, or the output of pl-dicom_pixel_redact (clean pixels, identified
+headers) when pixel scrubbing runs first. Either way, the audit compares
+headers before and after pl-dicom_anonymize.
 
-The anonymization plugin keeps nothing it could hand to an auditor:
+## Inputs
 
-* dicom-anonymizer holds its old→new UID map in a module-level dictionary
-  that disappears when the process exits.
-* Dates are replaced with dummy values (`00010101`, etc.), not shifted.
-* `deidentification_summary.json` lists per-file status but no mappings.
+A ds plugin has one input directory, so the two parent nodes are joined first
+with `pl-topologicalcopy --groupByInstance`, which puts each parent's output in
+its own subdirectory:
 
-So this plugin does not depend on the anonymizer recording anything. It
-reconstructs every mapping from the data itself. pl-dicom_anonymize keeps
-the input directory hierarchy exactly, so each file in the pixel-redaction
-output pairs with the file at the same relative path in the anonymization
-output. Both headers are read with pydicom and diffed element by element,
-recursing into sequences and including File Meta Information.
+```
+inputdir/
+├── pl-dircopy_1/                    original tree
+│   └── p01/s1/1.dcm …
+└── pl-dicom_anonymize_2/            anonymized tree
+    ├── deidentification_summary.json
+    └── p01/s1/1.dcm …
+```
 
-As a result the audit describes **what actually happened** to each file,
-not what a policy says should have happened. It keeps working if the
-anonymization profile, dictionary or engine changes.
+* **Anonymized tree.** Found automatically as the directory containing
+  `deidentification_summary.json`. Override it with `--anonymizedDir`.
+* **Original tree.** Found automatically as the one other top-level
+  subdirectory. Override it with `--originalDir`.
+* **Pairing.** Files are paired by relative path. pl-dicom_anonymize keeps
+  the input hierarchy exactly, so `pl-dircopy_1/p01/s1/1.dcm` pairs with
+  `pl-dicom_anonymize_2/p01/s1/1.dcm`.
+* **DICOM detection.** By content (`DICM` at byte 128), not by extension,
+  exactly as pl-dicom_anonymize does it. Files whose File Meta Information is
+  malformed are rejected, not parsed leniently.
+* **Without an anonymizer summary.** If you point `--anonymizedDir` at
+  another tool's output, the plugin still pairs by path. It just can't tell
+  "failed" from "never processed".
+* **Pixel redaction records.** If the original tree is pl-dicom_pixel_redact
+  output run with `--save-bboxes`, its `<stem>.json` bounding-box files are
+  recognised and summarised (see `pixel_redactions.csv`).
 
-## Wiring it up in ChRIS
+If the layout is ambiguous (no summary, two summaries, extra top-level
+directories), or the join was made without `--groupByInstance`, the plugin
+exits 2 with an explanation and writes nothing.
 
-A ds plugin has a single input directory, so the two parent nodes are joined
-first:
-
-1. `pl-dicom_pixel_redact` runs on the raw DICOM node (optionally with
-   `--save-bboxes`; see *Pixel redaction record* below).
-2. `pl-dicom_anonymize` runs as a child of the pixel-redaction node.
-3. `pl-topologicalcopy` runs with `--plugininstances <redact_id>,<anonymize_id>`
-   and **`--groupByInstance`**, so each parent's output lands in its own
-   subdirectory.
-4. `pl-dicom_audit` runs as a child of the topological node.
-
-The plugin finds the two trees on its own. The de-identified tree is the
-directory that contains `deidentification_summary.json`. The identified
-tree is the one other top-level subdirectory. If the layout is anything
-else, pass `--anonymizedDir` / `--identifiedDir`. If the join was made
-without `--groupByInstance`, the two trees overlap and the plugin exits 2
-with an explanation.
-
-## Output
+## Outputs
 
 ```
 outputdir/
-├── audit_summary.json          PHI-free; safe for job logs, dashboards, sharing
-└── restricted/                 CONTAINS PHI: the re-identification key
+├── audit_summary.json        no PHI: counts, findings, path hashes, file hashes
+└── restricted/               PHI: the re-identification key
     ├── README.txt
-    ├── patients.csv            original PatientID/Name → de-identified, date handling, offset
-    ├── accessions.csv          original AccessionNumber → de-identified
-    ├── uids.csv                original Study/Series/SOP/FoR UID → de-identified, by level
-    ├── dates.csv               every DA/DT/TM element: original, new, action, delta_days
-    ├── pixel_redactions.csv    per-file pixel redaction record + pixel integrity
-    └── file_audit.jsonl        one JSON record per file, listing every header change
+    ├── patients.csv
+    ├── accessions.csv
+    ├── uids.csv
+    ├── dates.csv
+    ├── leaks.csv
+    ├── pixel_redactions.csv
+    └── file_audit.jsonl
 ```
 
-**`restricted/` is a re-identification key.** Anyone holding it together
-with the de-identified dataset can re-identify every patient. Restrict
-access to this plugin instance's output the same way you restrict the
-original data, and never publish or share it alongside the de-identified
-dataset. `audit_summary.json` records the SHA-256 of every restricted file,
-so later tampering is detectable without anyone opening the PHI.
+### `restricted/`: contains PHI
 
-### Per-file change log
+| file | one row per | columns |
+|---|---|---|
+| `patients.csv` | original patient | `original_patient_id`, `original_patient_name`, `anonymized_patient_id`, `anonymized_patient_name`, `pseudonym_consistent`, `date_handling`, `date_offset_days`, `date_offset_consistent`, `n_studies`, `n_files` |
+| `accessions.csv` | original accession number | `original_accession_number`, `anonymized_accession_number`, `original_patient_id`, `original_study_instance_uid`, `consistent` |
+| `uids.csv` | original UID that was replaced | `level` (study / series / sop / frame_of_reference / other), `original_uid`, `anonymized_uid`, `occurrences`, `consistent` |
+| `dates.csv` | date/time element (DA, DT, TM) | `patient_key`, `file`, `element`, `vr`, `original`, `new`, `action`, `delta_days` |
+| `leaks.csv` | original value found in the output | `file`, `location` (element path, `<path>` or `<content>`), `kind` (text / uid / path / non_dicom_content), `source_keyword`, `matched`, `occurrences` |
+| `pixel_redactions.csv` | file with a pixel-redaction record | `file`, `status`, `boxes`, `entity_types`, `min_score`, `max_score`, `pixel_integrity` |
+| `file_audit.jsonl` | **file in either tree** | see below |
 
-Each `file_audit.jsonl` record lists every element that changed. Each entry
-has its path (e.g. `ReferencedImageSequence[0].ReferencedSOPInstanceUID`),
-tag, VR, original and new values, and one of these actions:
+Each `file_audit.jsonl` record has these fields:
+
+* `path`, `path_hash`
+* `original` and `anonymized`: `dicom`, `other`, or `null` if the file is
+  absent from that tree
+* `anonymizer_status`, as reported in `deidentification_summary.json`
+* `status` (see [File accounting](#file-accounting))
+
+For an audited pair, the record also has:
+
+* `original_sha256`, `anonymized_sha256`
+* `patient_key`
+* `action_counts`
+* `identifying_retained`: identifying keywords that kept their value
+* `leaks`
+* `pixel_integrity`
+* `changes`: one entry per element
+
+Each `changes` entry looks like this:
+
+```json
+{"path": "ReferencedImageSequence[0].ReferencedSOPInstanceUID",
+ "tag": "(0008,1155)", "keyword": "ReferencedSOPInstanceUID", "vr": "UI",
+ "action": "emptied", "original": "1.2.826.0.1…", "new": ""}
+```
 
 | action | meaning |
 |---|---|
-| `removed` | present in the identified header, absent after de-identification |
-| `emptied` | still present, but zero-length |
-| `replaced` | present with a different non-empty value |
-| `added` | absent before, present after |
-| `retained` | unchanged, recorded only for identifying elements and dates |
+| `replaced` | present in both with different non-empty values |
+| `emptied` | still present, now zero-length |
+| `removed` | present in the original, absent from the anonymized file |
+| `added` | absent from the original, present in the anonymized file |
+| `retained` | unchanged (recorded for every non-empty element) |
 | `items_removed` / `items_added` | the sequence's item count changed |
 
-Binary values (OB/OW/UN, …) are recorded as SHA-256 + length, not verbatim.
-PixelData is excluded here and checked separately.
+Sequences are compared item by item, and File Meta Information is included
+(`file_meta.*`). Binary values (OB/OW/UN, …) are recorded as SHA-256 + length.
+PixelData is not diffed; it is checked for byte-identity instead (see
+`--skipPixelCheck`).
 
-### Dates
+Each date is classified as one of:
 
-Every date/time element is classified:
+* `replaced_dummy`: dicom-anonymizer's `00010101` / `000000.00` / … values
+* `shifted`: a different real date, with `delta_days` recorded
+* `retained`, `emptied`, `removed`, or `replaced`
 
-| action | meaning |
-|---|---|
-| `replaced_dummy` | dicom-anonymizer's dummy value (`00010101`, `00010101010101.000000+0000`, `000000.00`) |
-| `shifted` | moved to a different real date; `delta_days` recorded |
-| `retained`, `removed`, `emptied`, `replaced` | as above |
+`patients.csv` reports a per-patient offset only if every shifted date for that
+patient moved by the same number of days.
 
-`patients.csv` reports a per-patient `date_offset_days` only if every shifted
-DA/DT element for that patient moved by the same number of days. If they
-moved by different amounts, `date_offset_consistent=False` and the summary
-raises a warning.
+### `audit_summary.json`: no PHI
 
-With pl-dicom_anonymize's current defaults, dates come out as
-`replaced_dummy` and no offset exists, so date intervals are **not**
-preserved. Shift detection is ready for the day the header stage starts
-shifting dates.
+* **Versions.** The plugin's own, plus the anonymizer's settings as recorded
+  in its summary.
+* **Files.** Counts by status, and `pairing_complete`.
+* **Header changes.** Counts by action, plus which identifying elements were
+  retained.
+* **Mappings.** Patient and accession counts, UID counts by level, and UID
+  mapping conflicts.
+* **Dates.** Counts by date action.
+* **Leaks.** Counts by kind and keyword, plus the path hashes of affected
+  files.
+* **Pixels.** Integrity and redaction counts.
+* **Findings.** `findings` and `overall_status` (`pass`/`fail`).
+* **`file_index`.** Every file's path hash and status, plus the anonymized
+  file's SHA-256 for audited pairs.
+* **`restricted_files_sha256`.** The SHA-256 of every file in `restricted/`,
+  so tampering can be detected without opening the PHI.
 
-### Pixel checks
+## Leak scan
 
-* **Integrity (always on unless `--skipPixelCheck`).** The PixelData of each
-  pixel-redacted file must be byte-identical to the de-identified file. That
-  is how the audit confirms the header stage did not alter, re-encode or
-  replace the redacted pixels.
-* **Pixel redaction record.** When pl-dicom_pixel_redact runs with
-  `--save-bboxes`, it writes Presidio's bounding boxes next to each output
-  DICOM (`<stem>.json`: entity type, score, box). The audit records the box
-  count, entity types and score range for each file. A file with no sidecar
-  is reported as `no_sidecar`, which does **not** mean nothing was redacted.
+The plugin searches the anonymized output for values taken from the original
+headers. This check is independent of pl-dicom_anonymize's own verification and
+broader than it: that verification compares a fixed list of core tags for
+values that survived byte-for-byte.
 
-## Checks and exit status
-
-The plugin always writes the full audit first, then sets its exit status.
-
-| finding | severity | effect |
+| what is searched | for what | match |
 |---|---|---|
-| `residual_phi`: a value from the identified header (patient name or any of its components, IDs, birth date, accession, institution, physicians, …) appears anywhere in the de-identified header, including nested and private elements | error | exit 1 |
-| `pixel_mismatch` | error | exit 1 |
-| `uid_one_to_many` / `uid_many_to_one`: one original UID got two new ones, or two originals collapsed into one | error | exit 1 |
-| `unpaired_or_unreadable`: a file the anonymizer reported as processed is missing or not valid DICOM | error | exit 1 |
-| `deidentification_failed`, `not_deidentified`, `unlisted_deidentified` | warning | none |
-| `pseudonym_inconsistent`, `pseudonym_collision` | warning | none |
-| `uid_reference_emptied`: `Referenced*UID` elements were emptied, not remapped, so cross-object links no longer resolve | warning | none |
-| `date_offset_inconsistent` | warning | none |
-| `pixel_redaction_unrecorded` | info | none |
+| every element of each anonymized file, including nested sequences, private tags (UN decoded as text) and File Meta | that file's original names (and each name component), IDs, birth date, address, phone, accession, institution, physicians, operators | case-insensitive substring |
+| every UI element of each anonymized file | that file's original Study/Series/SOP/FoR Instance UIDs | exact |
+| every UI value in the whole anonymized tree | **any** file's original instance UIDs (e.g. a reference that still points to another file's original SOP Instance UID) | exact |
+| every relative path in the anonymized tree | every value above, from every file | case-insensitive substring |
+| every non-DICOM file in the anonymized tree, including `deidentification_summary.json` | every value above, from every file | case-insensitive substring (first 64 MiB) |
 
-Use `--reportOnly` to always exit 0 and rely on `overall_status` in the
-summary instead.
+Numeric values (IDs, dates) only match when they stand alone, i.e. not run
+into other letters or digits. Without that rule, a short accession number would
+match inside hex hashes and timestamps. Text values match anywhere: `DOE` is
+found in `Doe_Jane` and in `DoeJane`.
 
-The residual-PHI scan is independent of pl-dicom_anonymize's own
-verification, and it is broader. That verification checks a fixed list of
-core tags for values that survived byte-for-byte. This scan looks for every
-identifying token inside **every** text element. For example, a
-`StudyDescription` of `follow-up for Doe` kept by a custom dictionary passes
-the anonymizer and fails here. Elements your policy keeps on purpose go in
-`--acknowledgeRetainedTags`, using the same value you gave the anonymizer.
+Two leaks come up often enough to call out:
 
-### What the anonymizer's defaults look like through this audit
+* **Folder and file names.** pl-dicom_anonymize copies paths verbatim, so a
+  PACS export laid out as `Doe_Jane/…` or `<StudyInstanceUID>/…` carries PHI
+  straight into the anonymized node. Its own `deidentification_summary.json`
+  repeats those paths. Both are reported as `phi_in_path` and
+  `phi_in_non_dicom`.
+* **Free text kept by a custom dictionary.** For example, a
+  `StudyDescription` of `follow-up for Doe` under `{"StudyDescription":
+  "keep"}` passes pl-dicom_anonymize's verification and fails here.
 
-Running the pinned `dicom-anonymizer==1.0.13.post1` (PS3.15 2023e profile)
-with no dictionary gives these results:
+Elements your policy keeps on purpose go in `--acknowledgeRetainedTags`, using
+the same value you gave pl-dicom_anonymize. The scan skips them.
 
-* `PatientID`, `PatientName` and `AccessionNumber` are **emptied**, so
-  `patients.csv` maps every patient to an empty pseudonym. Longitudinal
-  linkage across separate runs is not possible. Within a run, the crosswalk
-  still records which original patient each file belonged to.
-* Study, series and SOP instance UIDs are remapped consistently within the
-  run.
-* UIDs inside `ReferencedImageSequence` are emptied, which raises
-  `uid_reference_emptied`.
-* Dates are `replaced_dummy`.
-* Private tags are removed.
+## File accounting
 
-## CLI options
+Every relative path found in either tree or in the anonymizer's summary gets
+exactly one status:
 
-| Option | Description |
+| status | meaning | category |
+|---|---|---|
+| `audited` | original and anonymized DICOM paired and compared | ok |
+| `failed_deidentification` | the anonymizer reported a failure; no output | pairing |
+| `not_deidentified` | original DICOM the anonymizer never processed (its `--pattern` missed it, or it stopped early) | pairing |
+| `missing_anonymized` | the anonymizer says processed, but there is no output file | pairing |
+| `missing_original` | the anonymizer's summary lists a path absent from the original tree | pairing |
+| `unmatched_anonymized` | anonymized DICOM with no original counterpart | pairing |
+| `anonymized_not_dicom` | the original is DICOM but the output at that path is not | pairing |
+| `unreadable` | either side could not be parsed as conformant DICOM | pairing |
+| `non_dicom_copied` | non-DICOM passed through unexamined (`--copyNonDicom`); content is scanned for leaks | warning |
+| `extra_anonymized_file` | non-DICOM in the anonymized tree with no original | warning |
+| `not_dicom` | non-DICOM original, not passed through | info |
+| `redaction_sidecar` | pl-dicom_pixel_redact bounding-box JSON | info |
+
+Pairing is **complete** only when no file has a `pairing` status and at least
+one pair was audited.
+
+## Findings and exit status
+
+The audit is always written in full before the exit status is decided.
+
+| exit | when |
 |---|---|
-| `--identifiedDir SUBDIR` | identified tree (pixel-redaction output) under inputdir; default: auto-detect |
-| `--anonymizedDir SUBDIR` | de-identified tree under inputdir; default: the directory containing `deidentification_summary.json` |
-| `--acknowledgeRetainedTags TAG[,TAG...]` | elements the policy keeps on purpose; excluded from the residual-PHI scan |
-| `--residualMinLength N` | shortest identifying token searched for (default 3; shorter tokens are too noisy) |
-| `--skipPixelCheck` | skip the PixelData integrity comparison |
-| `--reportOnly` | always exit 0 once the audit is written |
+| 0 | the audit was written (with `--failOnLeak`: and no error finding) |
+| 1 | `--failOnLeak` is set and an error finding was raised |
+| 2 | the input layout could not be resolved; nothing written |
 
-## Log hygiene
+Without `--failOnLeak`, the plugin exits 0 and you read `overall_status` from
+`audit_summary.json`. Set the flag when the audit should stop a pipeline.
 
-stdout and stderr, which ChRIS exposes as job logs, contain only counts,
-finding codes and 12-character path hashes. Those hashes match the ones
-pl-dicom_anonymize prints. Exception text is replaced with fixed
-descriptions, and pydicom warnings are suppressed, because both can quote
-tag values. `audit_summary.json` follows the same rules.
+| finding | category | severity |
+|---|---|---|
+| `residual_phi`: original values in anonymized headers | leak | error |
+| `uid_leak`: original instance UIDs in the anonymized output | leak | error |
+| `phi_in_path`: original values in anonymized file paths | leak | error |
+| `phi_in_non_dicom`: original values in non-DICOM files of the anonymized tree | leak | error |
+| `incomplete_pairing`: any `pairing` status above (broken down by status) | pairing | error |
+| `nothing_audited`: no pair was audited | pairing | error |
+| `pixel_mismatch`: PixelData differs between the trees | integrity | error |
+| `uid_one_to_many` / `uid_many_to_one`: inconsistent UID mapping | integrity | error |
+| `non_dicom_copied`, `extra_anonymized_file`, `unlisted_in_anonymizer_summary`, `non_dicom_partially_scanned` | coverage | warning |
+| `pseudonym_inconsistent`, `pseudonym_collision`, `uid_reference_emptied`, `date_offset_inconsistent`, `dates_retained` | consistency | warning |
+| `not_dicom`, `redaction_sidecar`, `pixel_redaction_unrecorded` | coverage | info |
 
-## Limitations
+`--failOnLeak` also fails on the integrity errors. A pixel mismatch can mean
+the anonymized file does not carry the scrubbed pixels, and a many-to-one UID
+mapping merges distinct studies. Neither should pass silently.
 
-* **The audit itself is PHI**, and so is its input: the topological join
-  copies the identified intermediate tree into the audit node's input. The
-  pipeline's "delete the intermediate after the header stage" rule
-  therefore applies to the join node and the pixel-redaction node, and only
-  after this audit has run.
-* **Residual-PHI matching is literal.** It finds verbatim and
-  case-insensitive substring matches of known values. It does not catch
-  reformatted values (`Jane Doe` vs `DOE^JANE` is caught through name
-  components, but `01/01/1980` vs `19800101` is not), identifiers shorter
-  than `--residualMinLength`, or PHI that was never in a header tag.
-* **Pixel PHI is not re-detected.** The pixel checks confirm the redacted
-  pixels passed through unchanged and record what pixel-redact reported.
-  They do not re-run OCR.
-* **Pairing is by relative path.** It relies on pl-dicom_anonymize keeping
-  the hierarchy, which that plugin guarantees.
+### What pl-dicom_anonymize's defaults look like through this audit
 
-## Development
+Run with no dictionary, pl-dicom_anonymize 1.2.0 (dicom-anonymizer
+1.0.13.post1, PS3.15 2023e profile) produces this:
 
-```bash
-python -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-pip install ".[dev]"
-pytest -v
-```
+* PatientID, PatientName and AccessionNumber are **emptied**, so every patient
+  maps to an empty pseudonym. Within a run, `patients.csv` still records which
+  original patient each file belonged to.
+* Study, series and SOP Instance UIDs are remapped consistently within the
+  run.
+* UIDs inside `ReferencedImageSequence` are **emptied**, not remapped
+  (`uid_reference_emptied`).
+* Dates become dummy values (`replaced_dummy`), so date intervals are lost.
+* Private tags are removed.
+* Paths are copied verbatim (see [Leak scan](#leak-scan)).
 
-The dev extra installs `dicom-anonymizer` at the same pin as
-pl-dicom_anonymize, so the tests audit trees produced by the real engine.
+## Options
 
-### Test inside Docker
+| option | default | description |
+|---|---|---|
+| `--originalDir SUBDIR` | auto | subdirectory of inputdir holding the original tree |
+| `--anonymizedDir SUBDIR` | auto | subdirectory of inputdir holding the anonymized tree |
+| `--acknowledgeRetainedTags TAG[,TAG…]` | none | DICOM keywords the policy keeps on purpose; excluded from the leak scan |
+| `--residualMinLength N` | 3 | shortest original value (or name component) searched for. Raise it if short IDs cause false positives |
+| `--skipPixelCheck` | off | do not check that PixelData is byte-identical |
+| `--failOnLeak` | off | exit 1 on any leak, incomplete pairing or integrity error |
+| `-V`, `--version` | | print the version |
 
-```bash
-docker build --build-arg extras_require=dev -t pl-dicom_audit:dev .
-docker run --rm -v "$PWD:/app:ro" -w /app pl-dicom_audit:dev pytest -v -o cache_dir=/tmp/pytest
-```
+## Usage
 
-As with pl-dicom_anonymize, the image deletes its source tree after
-installing. The volume mount supplies `tests/`, and `-o cache_dir` is needed
-because the mount is read-only.
+### In ChRIS
 
-### Running with Docker
+1. Run `pl-dicom_anonymize` as a child of the node holding the original DICOMs.
+2. Run `pl-topologicalcopy` on the original node and the anonymize node, with
+   `--plugininstances <original_id>,<anonymize_id>` and `--groupByInstance`.
+3. Run `pl-dicom_audit` as a child of the topological node, usually with
+   `--failOnLeak`, and with the same `--acknowledgeRetainedTags` you gave the
+   anonymizer.
+4. Before sharing the anonymized data, read the audit node's
+   `audit_summary.json` (or rely on `--failOnLeak` having stopped the run).
+   Then follow [Sensitivity and access control](#sensitivity-and-access-control).
+
+The plugin descriptor CUBE needs is printed by
+`chris_plugin_info --dock-image <image> dicom_audit` (standard `chris_plugin`
+tooling). CI uploads it on every semver tag push.
+
+### With Docker
 
 ```bash
 docker run --rm \
     -v $PWD/joined:/incoming:ro \
     -v $PWD/audit:/outgoing \
     ghcr.io/fnndsc/pl-dicom_audit:latest \
-    dicom_audit /incoming /outgoing
+    dicom_audit --failOnLeak /incoming /outgoing
 ```
+
+To reproduce the ChRIS layout locally:
+
+```bash
+mkdir -p joined/original
+cp -r raw/. joined/original/
+docker run --rm -v $PWD/raw:/incoming:ro -v $PWD/joined/anonymized:/outgoing \
+    ghcr.io/fnndsc/pl-dicom_anonymize:1.2.0 dicom_anonymize /incoming /outgoing
+docker run --rm -v $PWD/joined:/incoming:ro -v $PWD/audit:/outgoing \
+    ghcr.io/fnndsc/pl-dicom_audit:latest dicom_audit --failOnLeak /incoming /outgoing
+```
+
+### From the command line
+
+```bash
+pip install -r requirements.txt && pip install .
+dicom_audit [--originalDir SUBDIR] [--anonymizedDir SUBDIR] [--failOnLeak] INPUTDIR OUTPUTDIR
+```
+
+## Sensitivity and access control
+
+**The audit log is a re-identification key.** `restricted/` maps every
+anonymized identifier, UID and date back to the original patient. Anyone who
+holds it together with the anonymized data can re-identify every patient. Treat
+it at least as strictly as the original identified data.
+
+In ChRIS, access is granted per **feed**: whoever can see a feed can browse
+every node's output files and job logs in it. The audit node cannot be put
+anywhere safer than its parents, because its input (the topological join)
+already contains a full copy of the original, identified DICOMs. So the
+recommendations are about the feed as a whole:
+
+1. **Treat the whole feed as PHI.** It holds the original data, the join copy
+   and the re-identification key. Never make it public. Share it only with the
+   named people authorized to re-identify (for example, an honest broker or
+   the data custodian), not with the researchers who will receive the
+   anonymized data.
+2. **Release anonymized data from a separate feed.** Once the audit passes,
+   start a new feed from the anonymize node's output (for example, with
+   `pl-dircopy` pointed at that node's output path) and share that feed. That
+   way, sharing the anonymized dataset never grants access to the audit or
+   the originals.
+3. **Attach nothing below the audit node** except tools run by the same
+   authorized people. A child node receives `restricted/` as its input and
+   could republish it.
+4. **Choose a compute resource approved for PHI.** The plugin runs wherever
+   CUBE schedules it, and its input is staged there.
+5. **Keep a copy only where your policy requires one.** If the key must be
+   retained (to answer re-identification requests, for example), download
+   `restricted/` to storage approved for PHI, and record
+   `restricted_files_sha256` from the summary to detect later changes. Then
+   delete the feed (or the join and audit nodes) when the retention period
+   ends. CUBE administrators and the storage backend's administrators can read
+   every feed, so storage policy applies to them too.
+6. **What is safe to share.** `audit_summary.json` and the job log contain no
+   names, IDs, UIDs, dates or paths. They do contain 12-character SHA-256
+   prefixes of relative paths. If paths contain PHI (the `phi_in_path`
+   finding), someone who can guess a path could confirm the guess against its
+   hash, so treat the summary as internal, not public, in that case.
+
+If you need the anonymized output without any re-identification key at all,
+don't keep `restricted/`: let the feed retention policy delete it, or remove
+the audit node once its summary has been reviewed.
+
+## Log hygiene
+
+stdout and stderr, which ChRIS shows as the job log, contain only:
+
+* the banner;
+* one line per file with its sequence number, 12-character path hash and
+  status (the same hash pl-dicom_anonymize prints for that file);
+* totals, finding codes and counts.
+
+The log never contains identifiers, original values, UIDs or relative paths.
+Exception text is replaced with fixed descriptions, and pydicom warnings are
+suppressed, because both can quote tag values. `audit_summary.json` follows the
+same rules. Tests assert this for clean and leaking runs alike.
+
+## Limitations
+
+* **Literal matching.** The leak scan finds verbatim, case-insensitive
+  occurrences of known values and of name components. It misses:
+  * reformatted values (`01/01/1980` versus `19800101`);
+  * values shorter than `--residualMinLength`;
+  * PHI that was never in a header element.
+* **False positives.** A short, common name component (a 3-letter surname)
+  can match inside unrelated words or paths. Check `leaks.csv`, and raise
+  `--residualMinLength` if needed. Conversely, a numeric ID embedded in a
+  longer alphanumeric string (`MRN001234` when the ID is `001234`) is not
+  matched.
+* **Pixel PHI is not detected.** The pixel check only confirms PixelData passed
+  through unchanged. Burned-in text is pl-dicom_pixel_redact's job.
+* **Cross-file name scan.** Each file's headers are searched for that file's
+  own names, IDs and dates. Original UIDs, paths and non-DICOM files are
+  searched for every patient's values.
+* **Scope of the UID mapping.** The mapping covers one anonymizer run, which
+  matches pl-dicom_anonymize's own consistency scope.
+* **Inherits the sensitivity of its input.** The plugin cannot reduce the
+  sensitivity of a feed that already holds the original data. See
+  [Sensitivity and access control](#sensitivity-and-access-control).
+
+## Development and testing
+
+```bash
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+pip install ".[dev]"          # pytest, dicom-anonymizer, pl-dicom_anonymize 1.2.0
+pytest -v
+```
+
+| suite | what it covers |
+|---|---|
+| `tests/test_engine.py` | unit tests: diff, date classification, leak scan, needle index, crosswalk, pairing classification, layout detection |
+| `tests/test_audit.py` | integration: `main()` over trees anonymized in-process with the real dicom-anonymizer engine |
+| `tests/test_e2e.py` | end to end: the real `dicom_anonymize` CLI, then the `dicom_audit` CLI, as subprocesses; plus the ChRIS descriptor |
+
+The install is non-editable, so the tests exercise the installed package. After
+editing source, run `pip install .` again before `pytest`, or you will test the
+previous build. The e2e suite is skipped if `dicom_anonymize` is not installed,
+except when `CI` is set, where it fails instead.
+
+Inside Docker, as CI runs it:
+
+```bash
+docker build --build-arg extras_require=dev -t pl-dicom_audit:dev .
+docker run --rm -e CI=true -v "$PWD:/app:ro" -w /app pl-dicom_audit:dev \
+    pytest -v -rs -o cache_dir=/tmp/pytest
+```
+
+See [MAINTENANCE.md](./MAINTENANCE.md) for dependency upgrades.

@@ -35,8 +35,9 @@ jobs:
           cache-to: type=gha,mode=max
       - name: Run pytest
         run: |
-          docker run -v "$GITHUB_WORKSPACE:/app:ro" -w /app localhost/local/app:dev \
-            pytest -o cache_dir=/tmp/pytest
+          # CI=true makes the e2e suite fail, not skip, if pl-dicom_anonymize is missing
+          docker run -e CI=true -v "$GITHUB_WORKSPACE:/app:ro" -w /app localhost/local/app:dev \
+            pytest -v -rs -o cache_dir=/tmp/pytest
 
   build:
     name: Build
