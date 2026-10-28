@@ -21,7 +21,7 @@ jobs:
     name: Unit tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: docker/setup-buildx-action@v4
       - name: Build
         uses: docker/build-push-action@v7
@@ -42,7 +42,7 @@ jobs:
   build:
     name: Build
     if: github.event_name == 'push' || github.event_name == 'release'
-    # needs: [ test ]  # uncomment to require passing tests
+    needs: [ test ]  # never push an image that failed its tests
     runs-on: ubuntu-24.04
 
     steps:

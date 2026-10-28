@@ -162,8 +162,31 @@ Each `changes` entry looks like this:
 
 Sequences are compared item by item, and File Meta Information is included
 (`file_meta.*`). Binary values (OB/OW/UN, …) are recorded as SHA-256 + length.
-PixelData is not diffed; it is checked for byte-identity instead (see
-`--skipPixelCheck`).
+PixelData is not diffed. Instead, each pair gets a `pixel_integrity` result:
+
+| result | meaning | severity |
+|---|---|---|
+| `match` | byte-identical in both files | ok |
+| `absent_both` | neither file has PixelData (e.g. a structured report) | ok |
+| `not_compared` | present in both; comparison skipped by `--skipPixelCheck` | ok |
+| `mismatch` | present in both, different bytes | error (`pixel_mismatch`) |
+| `absent_in_anonymized` / `absent_in_original` | present in only one file | error (`pixel_missing`) |
+
+`--skipPixelCheck` skips only the byte comparison. A file that lost its pixels
+is always an error.
+
+Files are also checked for completeness when read. pydicom reads a truncated
+file without complaint and returns whatever it parsed before the end, so the
+plugin itself rejects, as `unreadable`:
+
+* files that end part-way through an element;
+* native (uncompressed) PixelData shorter than Rows × Columns × frames
+  require;
+* datasets without a SOP Class/Instance UID.
+
+A file cut exactly on an element boundary is indistinguishable from a valid
+shorter file. The pixel-presence check and the diff (a run of `removed`
+elements) are what expose those.
 
 Each date is classified as one of:
 
@@ -202,16 +225,25 @@ values that survived byte-for-byte.
 
 | what is searched | for what | match |
 |---|---|---|
-| every element of each anonymized file, including nested sequences, private tags (UN decoded as text) and File Meta | that file's original names (and each name component), IDs, birth date, address, phone, accession, institution, physicians, operators | case-insensitive substring |
+| every element of each anonymized file, including nested sequences and File Meta; private OB/OW/UN elements and EncapsulatedDocument are decoded as text | that file's original names (and each name component), IDs, birth date, address, phone, accession, institution, physicians, operators | case-insensitive, see below |
 | every UI element of each anonymized file | that file's original Study/Series/SOP/FoR Instance UIDs | exact |
 | every UI value in the whole anonymized tree | **any** file's original instance UIDs (e.g. a reference that still points to another file's original SOP Instance UID) | exact |
-| every relative path in the anonymized tree | every value above, from every file | case-insensitive substring |
-| every non-DICOM file in the anonymized tree, including `deidentification_summary.json` | every value above, from every file | case-insensitive substring (first 64 MiB) |
+| every relative path in the anonymized tree | every value above, from every file | case-insensitive, see below |
+| every non-DICOM file in the anonymized tree, including `deidentification_summary.json` | every value above, from every file | case-insensitive, see below (first 64 MiB) |
 
-Numeric values (IDs, dates) only match when they stand alone, i.e. not run
-into other letters or digits. Without that rule, a short accession number would
-match inside hex hashes and timestamps. Text values match anywhere: `DOE` is
-found in `Doe_Jane` and in `DoeJane`.
+How a value matches depends on its shape:
+
+* **A single word** (letters and digits only: a name component like `ANN`, an
+  ID like `MRN001`, a date) matches only as a **whole word**: not run into
+  other letters or digits. So `DOE` is found in `Doe_Jane/`, `follow-up doe`
+  and `DOE^JANE`, but `ANN` is not found in `SCANNER`, `ZED` not in
+  `ANONYMIZED`, and a short accession number not inside a hex hash.
+* **Anything else** (a full name with `^`, an institution with spaces, a UID
+  with dots) matches as a substring.
+
+Standard binary elements other than PixelData (overlays, LUTs, icon images…)
+are not searched. Each anonymized file's record lists them, and the summary
+counts them by keyword under `binary_not_scanned`.
 
 Two leaks come up often enough to call out:
 
@@ -241,7 +273,8 @@ exactly one status:
 | `missing_original` | the anonymizer's summary lists a path absent from the original tree | pairing |
 | `unmatched_anonymized` | anonymized DICOM with no original counterpart | pairing |
 | `anonymized_not_dicom` | the original is DICOM but the output at that path is not | pairing |
-| `unreadable` | either side could not be parsed as conformant DICOM | pairing |
+| `unreadable` | either side could not be parsed as conformant DICOM, or is truncated or empty | pairing |
+| `dicom_without_preamble` | a DICOM dataset without the 128-byte preamble and `DICM` prefix. pl-dicom_anonymize skips these as non-DICOM, so the image is missing from the anonymized dataset | pairing |
 | `non_dicom_copied` | non-DICOM passed through unexamined (`--copyNonDicom`); content is scanned for leaks | warning |
 | `extra_anonymized_file` | non-DICOM in the anonymized tree with no original | warning |
 | `not_dicom` | non-DICOM original, not passed through | info |
@@ -258,7 +291,7 @@ The audit is always written in full before the exit status is decided.
 |---|---|
 | 0 | the audit was written (with `--failOnLeak`: and no error finding) |
 | 1 | `--failOnLeak` is set and an error finding was raised |
-| 2 | the input layout could not be resolved; nothing written |
+| 2 | the input layout could not be resolved (nothing written), or the audit failed part-way (ignore any partial output) |
 
 Without `--failOnLeak`, the plugin exits 0 and you read `overall_status` from
 `audit_summary.json`. Set the flag when the audit should stop a pipeline.
@@ -272,10 +305,11 @@ Without `--failOnLeak`, the plugin exits 0 and you read `overall_status` from
 | `incomplete_pairing`: any `pairing` status above (broken down by status) | pairing | error |
 | `nothing_audited`: no pair was audited | pairing | error |
 | `pixel_mismatch`: PixelData differs between the trees | integrity | error |
+| `pixel_missing`: PixelData present in only one of the pair | integrity | error |
 | `uid_one_to_many` / `uid_many_to_one`: inconsistent UID mapping | integrity | error |
 | `non_dicom_copied`, `extra_anonymized_file`, `unlisted_in_anonymizer_summary`, `non_dicom_partially_scanned` | coverage | warning |
 | `pseudonym_inconsistent`, `pseudonym_collision`, `uid_reference_emptied`, `date_offset_inconsistent`, `dates_retained` | consistency | warning |
-| `not_dicom`, `redaction_sidecar`, `pixel_redaction_unrecorded` | coverage | info |
+| `not_dicom`, `redaction_sidecar`, `pixel_redaction_unrecorded`, `binary_not_scanned` | coverage | info |
 
 `--failOnLeak` also fails on the integrity errors. A pixel mismatch can mean
 the anonymized file does not carry the scrubbed pixels, and a many-to-one UID
@@ -305,7 +339,7 @@ Run with no dictionary, pl-dicom_anonymize 1.2.0 (dicom-anonymizer
 | `--anonymizedDir SUBDIR` | auto | subdirectory of inputdir holding the anonymized tree |
 | `--acknowledgeRetainedTags TAG[,TAG…]` | none | DICOM keywords the policy keeps on purpose; excluded from the leak scan |
 | `--residualMinLength N` | 3 | shortest original value (or name component) searched for. Raise it if short IDs cause false positives |
-| `--skipPixelCheck` | off | do not check that PixelData is byte-identical |
+| `--skipPixelCheck` | off | skip the byte-for-byte PixelData comparison (missing pixels are still an error) |
 | `--failOnLeak` | off | exit 1 on any leak, incomplete pairing or integrity error |
 | `-V`, `--version` | | print the version |
 
@@ -391,10 +425,17 @@ recommendations are about the feed as a whole:
    ends. CUBE administrators and the storage backend's administrators can read
    every feed, so storage policy applies to them too.
 6. **What is safe to share.** `audit_summary.json` and the job log contain no
-   names, IDs, UIDs, dates or paths. They do contain 12-character SHA-256
-   prefixes of relative paths. If paths contain PHI (the `phi_in_path`
-   finding), someone who can guess a path could confirm the guess against its
-   hash, so treat the summary as internal, not public, in that case.
+   names, IDs, UIDs, dates or paths. They do contain path hashes: the first
+   12 hex characters of an **unsalted** SHA-256 of each relative path (the
+   same hash pl-dicom_anonymize prints, which is what lets the two logs be
+   correlated). An unsalted hash hides a path only if it can't be guessed.
+   When paths follow a predictable pattern (`<Surname>_<Given>/…`,
+   `<MRN>/…`, `<AccessionNumber>/…`), anyone with a candidate list of
+   patients can hash every candidate path and see which ones match, i.e.
+   confirm who is in the dataset. So the summary and job log are safe to
+   share **only** when paths carry no identifiers (no `phi_in_path`
+   finding). Otherwise treat them as internal to the people who can see the
+   original data.
 
 If you need the anonymized output without any re-identification key at all,
 don't keep `restricted/`: let the feed retention policy delete it, or remove
@@ -410,8 +451,11 @@ stdout and stderr, which ChRIS shows as the job log, contain only:
 * totals, finding codes and counts.
 
 The log never contains identifiers, original values, UIDs or relative paths.
-Exception text is replaced with fixed descriptions, and pydicom warnings are
-suppressed, because both can quote tag values. `audit_summary.json` follows the
+Exception text is replaced with fixed descriptions, pydicom warnings are
+suppressed for the whole run (pydicom validates lazily, when an element is
+first accessed, and its warnings quote the value), and any unexpected error is
+reported by class and a fixed description, never a traceback, because all of
+these can quote paths or tag values. `audit_summary.json` follows the
 same rules. Tests assert this for clean and leaking runs alike.
 
 ## Limitations
@@ -421,16 +465,26 @@ same rules. Tests assert this for clean and leaking runs alike.
   * reformatted values (`01/01/1980` versus `19800101`);
   * values shorter than `--residualMinLength`;
   * PHI that was never in a header element.
-* **False positives.** A short, common name component (a 3-letter surname)
-  can match inside unrelated words or paths. Check `leaks.csv`, and raise
-  `--residualMinLength` if needed. Conversely, a numeric ID embedded in a
-  longer alphanumeric string (`MRN001234` when the ID is `001234`) is not
-  matched.
+* **False positives.** A short name component that is also a common word
+  (`ANN`, `MAY`, `LEE`) still matches wherever that word appears on its own.
+  Check `leaks.csv`, and raise `--residualMinLength` if needed. Conversely,
+  an ID embedded in a longer alphanumeric string (`MRN001234` when the ID is
+  `001234`) is not matched.
 * **Pixel PHI is not detected.** The pixel check only confirms PixelData passed
   through unchanged. Burned-in text is pl-dicom_pixel_redact's job.
-* **Cross-file name scan.** Each file's headers are searched for that file's
-  own names, IDs and dates. Original UIDs, paths and non-DICOM files are
-  searched for every patient's values.
+* **Cross-file text in headers is not checked.** Each file's headers are
+  searched for **that file's own** names, IDs, dates and other text values.
+  Patient A's name sitting in patient B's header (a mis-filed study, a
+  comparison-study description naming another patient) is **not** detected.
+  Only original UIDs, file paths and non-DICOM files are searched for every
+  patient's values.
+* **Some binary elements are not searched.** Standard OB/OW elements other
+  than EncapsulatedDocument (overlays, LUTs, icon images) are not decoded as
+  text (see `binary_not_scanned`). Text encoded as UTF-16 or compressed
+  inside a private blob is not found either.
+* **Names run together.** Whole-word matching means a name component fused
+  with other letters (`DoeJane`, `JDoe`) is not matched, although
+  `Doe_Jane`, `Doe Jane` and `DOE^JANE` are.
 * **Scope of the UID mapping.** The mapping covers one anonymizer run, which
   matches pl-dicom_anonymize's own consistency scope.
 * **Inherits the sensitivity of its input.** The plugin cannot reduce the

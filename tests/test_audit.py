@@ -10,6 +10,8 @@ import json
 
 import pydicom
 import pytest
+from pydicom.dataset import Dataset
+from pydicom.sequence import Sequence
 from pydicom.uid import generate_uid
 
 from conftest import (ANON, ORIG, PHI_STRINGS, anonymize_tree, codes, make_dcm, read_jsonl,
@@ -493,3 +495,152 @@ def test_bad_layout_exits_2(inputdir, tmp_path, outdir, options, setup):
         root.mkdir()
         (root / "deidentification_summary.json").write_text(json.dumps({"files": []}))
     assert run(options, root, outdir) == 2
+
+
+# --------------------------------------------------------------------------
+# Review fixes (PR #1)
+# --------------------------------------------------------------------------
+
+def test_truncated_anonymized_file_is_unreadable(anonymized, outdir, options):
+    f = anonymized / ANON / "p02/s1/1.dcm"
+    f.write_bytes(f.read_bytes()[:-40])                      # cut into PixelData
+    assert run(options, anonymized, outdir) == 1
+    assert _statuses(outdir)["p02/s1/1.dcm"] == "unreadable"
+    rec = [r for r in read_jsonl(outdir / "restricted/file_audit.jsonl")
+           if r["path"] == "p02/s1/1.dcm"][0]
+    assert rec["error_class"] == "TruncatedDicomError"
+
+
+def test_header_truncated_file_is_unreadable(anonymized, outdir, options):
+    f = anonymized / ANON / "p02/s1/1.dcm"
+    f.write_bytes(f.read_bytes()[:400])
+    assert run(options, anonymized, outdir) == 1
+    assert _statuses(outdir)["p02/s1/1.dcm"] == "unreadable"
+
+
+@pytest.mark.parametrize("skip", [False, True])
+def test_pixels_removed_fails_even_with_skip_pixel_check(anonymized, outdir, options, skip, capsys):
+    rewrite(anonymized / ANON / "p02/s1/1.dcm", lambda ds: delattr(ds, "PixelData"))
+    options.skipPixelCheck = skip
+    assert run(options, anonymized, outdir) == 1
+    s = summary(outdir)
+    assert s["pixels"]["integrity"]["absent_in_anonymized"] == 1
+    assert "pixel_missing" in codes(outdir)
+    assert "[FAIL ]" in [l for l in capsys.readouterr().err.splitlines() if "PixelData" in l][0]
+
+
+def test_skip_pixel_check_reports_not_compared(anonymized, outdir, options):
+    options.skipPixelCheck = True
+    assert run(options, anonymized, outdir) == 0
+    assert summary(outdir)["pixels"]["integrity"] == {"not_compared": 4}
+
+
+def test_leak_in_private_ob(tmp_path, outdir, options):
+    root = tmp_path / "in"
+    make_dcm(root / ORIG / "a/1.dcm", private=False)
+    anonymize_tree(root / ORIG, root / ANON)
+    rewrite(root / ANON / "a/1.dcm", lambda ds: (
+        ds.add_new(0x00290010, "LO", "VENDOR"),
+        ds.add_new(0x00291010, "OB", b"\x00\x01Patient: DOE^JANE MRN001\x00")))
+    assert run(options, root, outdir) == 1
+    assert summary(outdir)["leaks"]["header_by_keyword"]["(0029,1010)"] >= 1
+
+
+def test_reviewer_false_positive_ann_zed(tmp_path, outdir, options):
+    """Name components ANN/ZED must not match inside SCANNER / ANONYMIZED."""
+    root = tmp_path / "in"
+    make_dcm(root / ORIG / "a/1.dcm", name="Ann^Zed", private=False)
+    rewrite(root / ORIG / "a/1.dcm", lambda ds: setattr(ds, "Manufacturer", "ACME SCANNER CO."))
+    anonymize_tree(root / ORIG, root / ANON)
+    assert run(options, root, outdir) == 0
+    assert summary(outdir)["leaks"]["header_files"] == 0
+
+
+def test_real_name_component_still_caught(tmp_path, outdir, options):
+    root = tmp_path / "in"
+    make_dcm(root / ORIG / "a/1.dcm", name="Ann^Zed", private=False,
+             description="follow-up for Zed, Ann")
+    anonymize_tree(root / ORIG, root / ANON, rules={(0x0008, 0x1030): lambda ds, tag: None})
+    assert run(options, root, outdir) == 1
+    hits = {r["matched"] for r in rows(outdir / "restricted/leaks.csv")}
+    assert {"ANN", "ZED"} <= hits
+
+
+def test_headerless_dicom_in_original_is_incomplete_pairing(anonymized, outdir, options):
+    from pydicom.filebase import DicomBytesIO
+    from pydicom.filewriter import write_dataset
+    ds = pydicom.dcmread(str(anonymized / ORIG / "p01/s1/1.dcm"))
+    bio = DicomBytesIO()
+    bio.is_little_endian, bio.is_implicit_VR = True, False
+    write_dataset(bio, ds)
+    (anonymized / ORIG / "p01/s1/IM0009").write_bytes(bio.getvalue())
+    assert run(options, anonymized, outdir) == 1
+    assert _statuses(outdir)["p01/s1/IM0009"] == "dicom_without_preamble"
+    f = {x["code"]: x for x in summary(outdir)["findings"]}
+    assert f["incomplete_pairing"]["by_status"] == {"dicom_without_preamble": 1}
+
+
+def test_binary_not_scanned_reported(tmp_path, outdir, options):
+    root = tmp_path / "in"
+    make_dcm(root / ORIG / "a/1.dcm", private=False)
+    anonymize_tree(root / ORIG, root / ANON)
+    rewrite(root / ANON / "a/1.dcm", lambda ds: ds.add_new(0x00880200, "SQ", Sequence([
+        _with_icon()])))
+    run(options, root, outdir)
+    f = {x["code"]: x for x in summary(outdir)["findings"]}
+    assert f["binary_not_scanned"]["severity"] == "info"
+    assert f["binary_not_scanned"]["by_keyword"] == {"PixelData": 1}
+
+
+def _with_icon():
+    icon = Dataset()
+    icon.Rows = icon.Columns = 2
+    icon.add_new(0x7FE00010, "OB", b"\x00\x01\x02\x03")      # nested icon pixels: not the image
+    return icon
+
+
+def test_unreadable_when_diff_fails_without_leaking(anonymized, outdir, options, monkeypatch,
+                                                    capsys):
+    import dicom_audit
+
+    def boom(*a, **k):
+        raise ValueError("Doe^Jane at p01/s1/1.dcm")
+    monkeypatch.setattr(dicom_audit, "diff_file", boom)
+    assert run(options, anonymized, outdir) == 1
+    assert set(_statuses(outdir).values()) == {"unreadable", "redaction_sidecar"}
+    rec = read_jsonl(outdir / "restricted/file_audit.jsonl")[0]
+    assert rec["error_class"] == "ValueError"
+    assert "Doe" not in rec["error_summary"]
+    err = capsys.readouterr().err
+    assert "Doe" not in err and "p01" not in err
+
+
+def test_hashing_failure_is_sanitized(anonymized, outdir, options, monkeypatch, capsys):
+    import dicom_audit
+
+    real = dicom_audit.file_sha256
+
+    def boom(path):
+        if path.suffix == ".dcm":                     # the audited DICOMs, not restricted/
+            raise PermissionError(f"[Errno 13] Permission denied: '{path}'")
+        return real(path)
+    monkeypatch.setattr(dicom_audit, "file_sha256", boom)
+    # handled per file (the reviewer's point): the file is unreadable and the
+    # audit still completes, rather than the error escaping with its path
+    assert run(options, anonymized, outdir) == 1
+    assert set(_statuses(outdir).values()) == {"unreadable", "redaction_sidecar"}
+    err = capsys.readouterr().err
+    assert "p01" not in err and "Traceback" not in err and "Errno" not in err
+
+
+def test_unexpected_error_exits_2_without_traceback(anonymized, outdir, options, monkeypatch,
+                                                    capsys):
+    import dicom_audit
+
+    def boom(path, rows, fields):
+        raise OSError(f"No space left on device: '{path}'")
+    monkeypatch.setattr(dicom_audit, "write_csv", boom)
+    assert run(options, anonymized, outdir) == 2
+    err = capsys.readouterr().err
+    assert "FATAL: audit did not complete (OSError)" in err
+    assert str(outdir) not in err and "Traceback" not in err

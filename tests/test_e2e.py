@@ -174,3 +174,22 @@ def test_chris_descriptor(tmp_path):
     assert params["--failOnLeak"]["default"] is False
     assert {"--originalDir", "--anonymizedDir", "--acknowledgeRetainedTags",
             "--residualMinLength", "--skipPixelCheck"} <= set(params)
+
+
+def test_invalid_values_never_reach_the_log(tmp_path, out):
+    """
+    pydicom validates lazily and its warnings quote the offending value. An
+    invalid UID that spells a name must not appear in the audit's job log.
+    The bytes are patched directly so pydicom cannot validate on write.
+    """
+    import pydicom
+    root = tmp_path / "join"
+    f = make_dcm(root / ORIG / "p01/1.dcm")
+    raw = f.read_bytes()
+    uid = pydicom.dcmread(str(f)).StudyInstanceUID.encode()
+    bad = (b"1.2.Doe.Jane." + b"0" * 64)[:len(uid)]
+    f.write_bytes(raw.replace(uid, bad))
+    anonymize(root)
+    r = audit(root, out)
+    log = r.stdout + r.stderr
+    assert "Doe" not in log and "Invalid value" not in log and "Warning" not in log

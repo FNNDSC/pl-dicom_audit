@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 
+import pydicom
 import pytest
 from pydicom.dataset import Dataset
 from pydicom.sequence import Sequence
@@ -20,6 +21,11 @@ from audit_engine import (
     find_residual_phi,
     find_residual_phi_in_file,
     token_in,
+    PIXEL_ERRORS,
+    TruncatedDicomError,
+    expected_pixel_bytes,
+    looks_like_headerless_dicom,
+    unscanned_binary,
     is_dicom_file,
     phi_needles,
     pixel_integrity,
@@ -218,13 +224,38 @@ def test_numeric_values_must_stand_alone():
     idx = NeedleIndex()
     idx.add({"1234": "AccessionNumber", "DOE": "PatientName"})
     assert idx.search('"path_hash": "9a1234bc"') == []
-    assert idx.search("scans/1234/doejane.dcm") == [("1234", "AccessionNumber"),
+    assert idx.search("scans/1234/doe_jane.dcm") == [("1234", "AccessionNumber"),
                                                     ("DOE", "PatientName")]
 
 
 def test_token_in():
-    assert token_in("DOE", "DOEJANE") and token_in("19800101", "BORN 19800101")
+    assert token_in("19800101", "BORN 19800101")
     assert not token_in("19800101", "X198001012")
+
+
+@pytest.mark.parametrize("token,hay,expected", [
+    # the reviewer's false positives: single words match only as whole words
+    ("ANN", "ACME SCANNER CO.", False),
+    ("ZED", "ANONYMIZED", False),
+    ("ANN", "ANONYMIZED", False),
+    # real leaks still found
+    ("DOE", "DOE_JANE/S1/1.DCM", True),              # underscore separates words
+    ("DOE", "FOLLOW-UP DOE KNEE", True),
+    ("DOE", "DOE^JANE", True),
+    ("MRN001", "PRIVATE NOTE MRN001", True),
+    ("JOSÉ", "PATIENT JOSÉ", True),                  # Unicode letters are word characters
+    ("JOSÉ", "JOSÉE", False),
+    # fused names are a documented miss
+    ("DOE", "DOEJANE", False),
+    # multi-word / punctuated values stay substrings
+    ("DOE^JANE", "XDOE^JANEX", True),
+    ("GENERAL HOSPITAL", "THEGENERAL HOSPITALS", True),
+])
+def test_whole_word_matching(token, hay, expected):
+    assert token_in(token, hay) is expected
+    idx = NeedleIndex()
+    idx.add({token: "PatientName"})
+    assert bool(idx.search(hay)) is expected
 
 
 def test_needle_index():
@@ -245,11 +276,15 @@ def test_pixel_integrity():
     a, b = Dataset(), Dataset()
     assert pixel_integrity(a, b) == "absent_both"
     a.PixelData = b"\x01"
-    assert pixel_integrity(a, b) == "absent_in_deidentified"
+    assert pixel_integrity(a, b) == "absent_in_anonymized"
+    assert pixel_integrity(b, a) == "absent_in_original"
+    assert pixel_integrity(a, b, compare=False) == "absent_in_anonymized"   # presence always checked
     b.PixelData = b"\x01"
     assert pixel_integrity(a, b) == "match"
     b.PixelData = b"\x02"
     assert pixel_integrity(a, b) == "mismatch"
+    assert pixel_integrity(a, b, compare=False) == "not_compared"
+    assert PIXEL_ERRORS == {"mismatch", "absent_in_anonymized", "absent_in_original"}
 
 
 def test_read_redaction_sidecar(tmp_path):
@@ -350,3 +385,133 @@ def test_locate_trees(tmp_path):
         locate_trees(tmp_path, "anon", "anon")
     with pytest.raises(LayoutError):
         locate_trees(tmp_path, "orig", "missing")
+
+
+# --------------------------------------------------------------------------
+# Review fixes: truncation, empty datasets, headerless DICOM
+# --------------------------------------------------------------------------
+
+def _element_boundaries(path):
+    """Byte offsets where a top-level element (or the file meta) ends."""
+    import warnings
+    from pydicom.dataelem import RawDataElement
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ds = pydicom.dcmread(str(path))
+    return {r.value_tell + r.length for r in ds._dict.values() if isinstance(r, RawDataElement)}
+
+
+def test_truncation_detected_at_every_cut(tmp_path):
+    """Cut a valid file at every byte. Each cut is either rejected, or lands
+    exactly on an element boundary (a valid shorter file)."""
+    good = make_dcm(tmp_path / "good.dcm")
+    raw = good.read_bytes()
+    boundaries = _element_boundaries(good)
+    cut_file = tmp_path / "cut.dcm"
+    accepted = []
+    for cut in range(132, len(raw)):
+        cut_file.write_bytes(raw[:cut])
+        try:
+            read_dicom(cut_file)
+        except Exception:
+            continue
+        accepted.append(cut)
+    assert accepted, "expected some boundary cuts to read as valid shorter files"
+    assert set(accepted) <= boundaries
+    cut_file.write_bytes(raw)
+    read_dicom(cut_file)                                   # the intact file still reads
+
+
+def test_short_native_pixel_data_rejected(tmp_path):
+    p = make_dcm(tmp_path / "a.dcm")
+    ds = read_dicom(p)
+    assert expected_pixel_bytes(ds) == 64
+    ds.PixelData = bytes(10)                               # well-formed element, too short
+    ds.save_as(str(p), write_like_original=False)
+    with pytest.raises(TruncatedDicomError):
+        read_dicom(p)
+
+
+def test_expected_pixel_bytes_unknown_for_compressed(tmp_path):
+    ds = read_dicom(make_dcm(tmp_path / "a.dcm"))
+    ds.file_meta.TransferSyntaxUID = "1.2.840.10008.1.2.4.50"   # JPEG Baseline
+    assert expected_pixel_bytes(ds) is None
+    ds.file_meta.TransferSyntaxUID = "1.2.840.10008.1.2.1"
+    ds.NumberOfFrames = 3
+    ds.BitsAllocated = 1
+    assert expected_pixel_bytes(ds) == (8 * 8 * 3 + 7) // 8
+
+
+def test_dataset_without_sop_uids_rejected(tmp_path):
+    p = make_dcm(tmp_path / "a.dcm")
+    ds = read_dicom(p)
+    del ds.SOPClassUID
+    ds.save_as(str(p), write_like_original=False)
+    with pytest.raises(MalformedDicomError):
+        read_dicom(p)
+
+
+def test_looks_like_headerless_dicom(tmp_path):
+    from pydicom.filebase import DicomBytesIO
+    from pydicom.filewriter import write_dataset
+    ds = read_dicom(make_dcm(tmp_path / "a.dcm"))
+    bio = DicomBytesIO()
+    bio.is_little_endian, bio.is_implicit_VR = True, False
+    write_dataset(bio, ds)
+    headerless = tmp_path / "IM0001"
+    headerless.write_bytes(bio.getvalue())
+    text = tmp_path / "notes.txt"
+    text.write_text("Patient Doe, seen 2024-03-01")
+    junk = tmp_path / "blob.bin"
+    junk.write_bytes(bytes(range(256)) * 4)
+    assert looks_like_headerless_dicom(headerless)
+    assert not is_dicom_file(headerless)
+    assert not looks_like_headerless_dicom(text)
+    assert not looks_like_headerless_dicom(junk)
+
+
+# --------------------------------------------------------------------------
+# Review fixes: binary elements
+# --------------------------------------------------------------------------
+
+def test_private_ob_ow_scanned_standard_binary_listed():
+    deid = Dataset()
+    deid.add_new(0x00290010, "LO", "VENDOR")
+    deid.add_new(0x00291010, "OB", b"\x00\x01Patient: DOE^JANE\x00")
+    deid.add_new(0x00291020, "OW", b"MRN001\x00\x00")
+    deid.add_new(0x00420011, "OB", b"%PDF-1.4 ... Report for DOE ...")   # EncapsulatedDocument
+    deid.add_new(0x60003000, "OW", b"DOE overlay bits")                   # OverlayData (repeating group, no keyword): not scanned
+    hits = find_residual_phi(deid, {"DOE": "PatientName", "MRN001": "PatientID"}, frozenset())
+    assert {h["path"] for h in hits} == {"(0029,1010)", "(0029,1020)", "EncapsulatedDocument"}
+    assert unscanned_binary(deid) == ["(6000,3000)"]
+
+
+def test_unscanned_binary_recurses_and_skips_pixels():
+    ds = Dataset()
+    ds.PixelData = b"\x00" * 4
+    item = Dataset()
+    item.add_new(0x00281201, "OW", b"\x00\x01")                          # RedPaletteColorLookupTableData
+    ds.IconImageSequence = Sequence([item])
+    assert unscanned_binary(ds) == ["IconImageSequence[0].RedPaletteColorLookupTableData"]
+
+
+# --------------------------------------------------------------------------
+# Review: coverage gaps
+# --------------------------------------------------------------------------
+
+def test_diff_sequence_items_added():
+    o = Dataset()
+    o.ReferencedImageSequence = Sequence([ds_with(ReferencedSOPInstanceUID="1.2.3")])
+    n = Dataset()
+    n.ReferencedImageSequence = Sequence([ds_with(ReferencedSOPInstanceUID="1.2.3"),
+                                          ds_with(ReferencedSOPInstanceUID="9.9.9")])
+    c = by_path(diff_datasets(o, n))["ReferencedImageSequence"]
+    assert (c.action, c.original, c.new) == ("items_added", 1, 2)
+
+
+def test_patient_with_no_dates():
+    x = Crosswalk()
+    x.add_file("a", ds_with(PatientID="P1"), Dataset(), [])
+    assert x.patient_date_handling(x.patients["P1"]) == ("no dates present", None, True)
+    row = next(x.rows_patients())
+    assert (row["date_handling"], row["date_offset_days"]) == ("no dates present", "")

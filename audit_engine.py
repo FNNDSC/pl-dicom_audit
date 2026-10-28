@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 import pydicom
+from pydicom.dataelem import RawDataElement
 from pydicom.dataset import Dataset
 from pydicom.errors import InvalidDicomError
 from pydicom.multival import MultiValue
@@ -103,7 +104,8 @@ def sanitize_exception(exc: BaseException) -> tuple[str, str]:
     name = type(exc).__name__
     known = {
         "InvalidDicomError": "file is not a valid DICOM file",
-        "MalformedDicomError": "file has DICOM magic bytes but no conformant File Meta Information",
+        "MalformedDicomError": "file has DICOM magic bytes but no conformant File Meta Information, or no SOP Class/Instance UID",
+        "TruncatedDicomError": "file is truncated (ends part-way through an element, or PixelData is shorter than the image dimensions require)",
         "FileNotFoundError": "file disappeared or was unreadable",
         "PermissionError": "insufficient filesystem permissions",
         "IsADirectoryError": "expected a file but found a directory",
@@ -133,12 +135,86 @@ class MalformedDicomError(InvalidDicomError):
 _REQUIRED_FILE_META = ("MediaStorageSOPClassUID", "MediaStorageSOPInstanceUID", "TransferSyntaxUID")
 
 
+class TruncatedDicomError(InvalidDicomError):
+    """The file ends before its declared content (pydicom reads it silently)."""
+
+
+#: Elements a dataset must have to count as a DICOM object at all. pydicom
+#: returns whatever it parsed before EOF, so a file cut off mid-header comes
+#: back as a handful of elements rather than an error.
+_REQUIRED_ELEMENTS = ("SOPClassUID", "SOPInstanceUID")
+
+
+def expected_pixel_bytes(ds: Dataset) -> Optional[int]:
+    """
+    Byte length native (uncompressed) PixelData must have, from Rows,
+    Columns, SamplesPerPixel, BitsAllocated and NumberOfFrames. None when it
+    cannot be computed (encapsulated transfer syntax, missing attributes).
+    """
+    meta = getattr(ds, "file_meta", None)
+    ts = getattr(meta, "TransferSyntaxUID", None) if meta is not None else None
+    if ts is None or ts.is_compressed:
+        return None
+    try:
+        rows, cols = int(ds.Rows), int(ds.Columns)
+        bits = int(ds.BitsAllocated)
+        spp = int(ds.get("SamplesPerPixel", 1) or 1)
+        frames = int(ds.get("NumberOfFrames", 1) or 1)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    n_bits = rows * cols * spp * frames * bits
+    return (n_bits + 7) // 8
+
+
+UNDEFINED_LENGTH = 0xFFFFFFFF
+
+
+def check_not_truncated(ds: pydicom.dataset.FileDataset, file_size: int) -> None:
+    """
+    pydicom stops quietly at end of file, so a truncated file reads "fine".
+    Right after dcmread every top-level element is still raw and carries its
+    declared length and file offset; use them to detect:
+
+    * an element whose value is shorter than its declared length (cut
+      mid-value), and
+    * bytes left over after the last element (cut mid-element-header).
+
+    A cut exactly on an element boundary is a valid shorter file and cannot
+    be told apart here; the pixel-presence check and the diff catch those.
+    Skipped where offsets do not map to file bytes (deflated transfer syntax)
+    or the last element has undefined length (encapsulated pixel data,
+    undefined-length sequences).
+    """
+    raws = [r for r in ds._dict.values() if isinstance(r, RawDataElement)]
+    for r in raws:
+        if r.length != UNDEFINED_LENGTH and r.value is not None and len(r.value) < r.length:
+            raise TruncatedDicomError("an element is shorter than its declared length")
+    ts = getattr(getattr(ds, "file_meta", None), "TransferSyntaxUID", None)
+    if not raws or (ts is not None and ts.is_deflated):
+        return
+    last = max(raws, key=lambda r: r.value_tell)
+    if last.length != UNDEFINED_LENGTH and last.value_tell + last.length != file_size:
+        raise TruncatedDicomError("file ends part-way through an element")
+
+
+def check_complete(ds: Dataset) -> None:
+    """Raise if a dataset read without error is nevertheless incomplete."""
+    if any(kw not in ds for kw in _REQUIRED_ELEMENTS):
+        raise MalformedDicomError("dataset has no SOP Class/Instance UID (empty or cut off)")
+    if 0x7FE00010 in ds:
+        expected = expected_pixel_bytes(ds)
+        actual = len(ds[0x7FE00010].value or b"")
+        if expected is not None and actual < expected:
+            raise TruncatedDicomError("PixelData is shorter than Rows x Columns x frames require")
+
+
 def read_dicom(path: Path) -> pydicom.dataset.FileDataset:
     """
-    Strict read, as pl-dicom_anonymize does it. pydicom will happily parse a
-    DICM-prefixed file of garbage into a near-empty dataset; diffing that
-    against a real header would show "everything removed" and pass the
-    audit, so such files are rejected instead.
+    Strict read, as pl-dicom_anonymize does it, plus completeness checks.
+    pydicom will happily parse a DICM-prefixed file of garbage, or a file cut
+    off part-way, into a partial dataset; diffing that against a real header
+    shows "everything removed" and would pass the audit, so such files are
+    rejected instead.
     """
     # pydicom warnings can quote values; they must never reach the job log.
     with warnings.catch_warnings():
@@ -147,7 +223,30 @@ def read_dicom(path: Path) -> pydicom.dataset.FileDataset:
     meta = getattr(ds, "file_meta", None)
     if meta is None or any(not hasattr(meta, k) for k in _REQUIRED_FILE_META):
         raise MalformedDicomError("missing mandatory File Meta Information")
+    check_not_truncated(ds, path.stat().st_size)     # before anything converts raw elements
+    check_complete(ds)
     return ds
+
+
+def looks_like_headerless_dicom(path: Path) -> bool:
+    """
+    True for a DICOM dataset written without the 128-byte preamble and DICM
+    prefix (older ACR-NEMA style exports). pl-dicom_anonymize's content sniff
+    skips these as "not DICOM", so they would otherwise vanish from the
+    anonymized dataset unnoticed. Only the header is read.
+    """
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ds = pydicom.dcmread(str(path), force=True, stop_before_pixels=True)
+        uid = str(ds.get("SOPInstanceUID", "") or "")
+        cls = str(ds.get("SOPClassUID", "") or "")
+    except Exception:  # noqa: BLE001 - anything unparseable is simply not DICOM
+        return False
+    return bool(_UID_RE.fullmatch(uid) and _UID_RE.fullmatch(cls))
+
+
+_UID_RE = re.compile(r"[0-9]+(\.[0-9]+)+")
 
 
 def get_elem(ds: Dataset, keyword: str):
@@ -363,10 +462,29 @@ def uid_needles(identified: pydicom.dataset.FileDataset) -> dict[str, str]:
     return out
 
 
-def _text_values(elem) -> list[str]:
-    """Searchable text of an element: text VRs as-is, UN (e.g. private tags
-    read implicitly) decoded as latin-1. Other binary VRs are not text."""
+#: Standard binary elements that commonly carry text (an embedded PDF/CDA
+#: report). Decoded and scanned like private binary elements.
+TEXT_BEARING_BINARY = frozenset({0x00420011})          # EncapsulatedDocument
+
+
+def is_scanned_binary(elem) -> bool:
+    """Binary elements the leak scan decodes as text: every UN element, every
+    private (odd-group) OB/OW element, and TEXT_BEARING_BINARY."""
+    if elem.tag == 0x7FE00010:
+        return False
     if elem.VR == "UN":
+        return True
+    return elem.VR in ("OB", "OW") and (elem.tag.is_private or elem.tag in TEXT_BEARING_BINARY)
+
+
+def _text_values(elem) -> list[str]:
+    """
+    Searchable text of an element: text VRs as-is; binary elements chosen by
+    is_scanned_binary() decoded as latin-1 (a vendor's private OB blob or an
+    embedded report can hold names in plain ASCII). Other binary VRs are not
+    searched; unscanned_binary() reports them.
+    """
+    if is_scanned_binary(elem):
         raw = bytes(elem.value or b"")
         return [raw.decode("latin-1")] if raw else []
     if elem.VR not in TEXT_VRS and elem.VR != "UI":
@@ -376,23 +494,52 @@ def _text_values(elem) -> list[str]:
     return [v for v in values if isinstance(v, str) and v]
 
 
+_WORDCHAR = r"[^\W_]"      # a Unicode letter or digit (underscore is a separator)
+
+
+def is_word(token: str) -> bool:
+    """A single word: letters and digits only (name components, most IDs)."""
+    return token.isalnum()
+
+
 def token_pattern(token: str) -> str:
     """
-    Regex for one needle (already upper-case). Numeric values (IDs, dates)
-    must stand alone, i.e. not run into other letters or digits, so a short
-    accession number does not match inside a hex hash, a UID or a timestamp.
-    Everything else is a plain substring, so "DOE" is found in "DOE_JANE"
-    and "FOLLOW-UP DOE".
+    Regex for one needle (already upper-case).
+
+    * A single word (letters/digits only: a name component such as "ANN",
+      an ID such as "MRN001" or "1234", a date) matches only as a whole
+      word, i.e. not run into other letters or digits. So "ANN" is not found
+      in "SCANNER", "ZED" not in "ANONYMIZED", "1234" not in a hex hash;
+      "DOE" is still found in "Doe_Jane/", "follow-up doe" and "DOE^JANE".
+    * Anything else (a full name with "^", an institution with spaces, a
+      UID with dots) is a plain substring.
     """
-    if token.isdigit():
-        return rf"(?<![0-9A-Z]){re.escape(token)}(?![0-9A-Z])"
+    if is_word(token):
+        return rf"(?<!{_WORDCHAR}){re.escape(token)}(?!{_WORDCHAR})"
     return re.escape(token)
 
 
 def token_in(token: str, hay_upper: str) -> bool:
-    if token.isdigit():
+    if is_word(token):
         return re.search(token_pattern(token), hay_upper) is not None
     return token in hay_upper
+
+
+def unscanned_binary(ds: Dataset, prefix: str = "") -> list[str]:
+    """Element paths of binary elements the leak scan does not search
+    (standard OB/OW/OF/OD/OL/OV), recursing. The top-level PixelData is
+    excluded because it has its own check; nested PixelData (an icon
+    thumbnail, which can carry burned-in text) is reported."""
+    out = []
+    for elem in ds:
+        name = element_name(elem)
+        if elem.VR == "SQ":
+            for i, item in enumerate(elem.value or []):
+                out.extend(unscanned_binary(item, f"{prefix}{name}[{i}]."))
+        elif (elem.VR in BINARY_VRS and not (elem.tag == 0x7FE00010 and not prefix)
+              and not is_scanned_binary(elem) and elem.value):
+            out.append(prefix + name)
+    return out
 
 
 def find_residual_phi(deidentified: Dataset, needles: dict[str, str],
@@ -503,15 +650,26 @@ def pixel_digest(ds: Dataset) -> Optional[str]:
     return sha256_hex(bytes(elem.value))
 
 
-def pixel_integrity(identified: Dataset, deidentified: Dataset) -> str:
-    a, b = pixel_digest(identified), pixel_digest(deidentified)
-    if a is None and b is None:
+#: pixel_integrity outcomes that are integrity errors.
+PIXEL_ERRORS = frozenset({"mismatch", "absent_in_anonymized", "absent_in_original"})
+
+
+def pixel_integrity(original: Dataset, anonymized: Dataset, compare: bool = True) -> str:
+    """
+    match | mismatch | absent_both | absent_in_original | absent_in_anonymized
+    | not_compared. Presence is always checked; compare=False skips only the
+    byte-for-byte comparison (--skipPixelCheck).
+    """
+    has_a, has_b = 0x7FE00010 in original, 0x7FE00010 in anonymized
+    if not has_a and not has_b:
         return "absent_both"
-    if a is None:
-        return "absent_in_identified"
-    if b is None:
-        return "absent_in_deidentified"
-    return "match" if a == b else "mismatch"
+    if not has_a:
+        return "absent_in_original"
+    if not has_b:
+        return "absent_in_anonymized"
+    if not compare:
+        return "not_compared"
+    return "match" if pixel_digest(original) == pixel_digest(anonymized) else "mismatch"
 
 
 def read_redaction_sidecar(identified_path: Path) -> dict:

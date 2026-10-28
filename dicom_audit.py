@@ -31,6 +31,7 @@ import hashlib
 import json
 import sys
 import time
+import warnings
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser, Namespace
 from collections import Counter
 from dataclasses import dataclass
@@ -44,11 +45,14 @@ from audit_engine import (
     WATCHED_KEYWORDS,
     Crosswalk,
     UID_NEEDLE_KEYWORDS,
+    PIXEL_ERRORS,
     NeedleIndex,
     diff_file,
     find_residual_phi_in_file,
     is_dicom_file,
+    looks_like_headerless_dicom,
     phi_needles,
+    unscanned_binary,
     pixel_integrity,
     read_dicom,
     read_redaction_sidecar,
@@ -200,20 +204,23 @@ STATUS_CATEGORY = {
     "missing_original": "pairing",          # anonymizer lists a path absent from the original tree
     "unmatched_anonymized": "pairing",      # anonymized DICOM with no original
     "anonymized_not_dicom": "pairing",      # original DICOM, but the output is not DICOM
-    "unreadable": "pairing",                # either side could not be parsed as DICOM
+    "unreadable": "pairing",                # either side could not be parsed as DICOM, or is truncated
+    "dicom_without_preamble": "pairing",    # DICOM with no preamble/DICM prefix: the anonymizer skips it
 }
 
 
 @dataclass
 class Entry:
     rel: str
-    orig_kind: Optional[str] = None         # "dicom" | "other" | None (absent)
+    orig_kind: Optional[str] = None         # "dicom" | "headerless" | "other" | None (absent)
     anon_kind: Optional[str] = None
     anonymizer_status: Optional[str] = None  # from deidentification_summary.json
 
 
 def _kind(path: Path) -> str:
-    return "dicom" if is_dicom_file(path) else "other"
+    if is_dicom_file(path):
+        return "dicom"
+    return "headerless" if looks_like_headerless_dicom(path) else "other"
 
 
 def build_inventory(orig: Path, anon: Path) -> tuple[list[Entry], dict]:
@@ -258,6 +265,9 @@ def classify(e: Entry, sidecars: set) -> str:
             return "missing_anonymized"
         return "not_deidentified"
 
+    if e.orig_kind == "headerless":
+        return "dicom_without_preamble"
+
     if e.orig_kind == "other":
         if e.rel in sidecars:
             return "redaction_sidecar"
@@ -268,7 +278,7 @@ def classify(e: Entry, sidecars: set) -> str:
         return "not_dicom"
 
     # absent from the original tree
-    if e.anon_kind == "dicom":
+    if e.anon_kind in ("dicom", "headerless"):
         return "unmatched_anonymized"
     if e.anon_kind == "other":
         return "extra_anonymized_file"
@@ -309,6 +319,7 @@ def audit_pair(e: Entry, orig: Path, anon: Path, xwalk: Crosswalk, needles: Need
     try:
         ids = read_dicom(ip)
         dds = read_dicom(ap)
+        hashes = {"original_sha256": file_sha256(ip), "anonymized_sha256": file_sha256(ap)}
     except Exception as ex:  # noqa: BLE001
         cls, summary = sanitize_exception(ex)
         rec.update(status="unreadable", error_class=cls, error_summary=summary)
@@ -323,6 +334,9 @@ def audit_pair(e: Entry, orig: Path, anon: Path, xwalk: Crosswalk, needles: Need
         needles.add(uid_needles(ids))
         ui_values = collect_ui_values(getattr(dds, "file_meta", None) or [], "file_meta.")
         ui_values += collect_ui_values(dds)
+        pixels = pixel_integrity(ids, dds, compare=not options.skipPixelCheck)
+        not_scanned = unscanned_binary(dds)
+        redaction = read_redaction_sidecar(ip)
     except Exception as ex:  # noqa: BLE001
         cls, summary = sanitize_exception(ex)
         rec.update(status="unreadable", error_class=cls, error_summary=summary)
@@ -332,15 +346,15 @@ def audit_pair(e: Entry, orig: Path, anon: Path, xwalk: Crosswalk, needles: Need
     rec.update(
         status="audited",
         patient_key=xwalk.patient_key(ids),
-        original_sha256=file_sha256(ip),
-        anonymized_sha256=file_sha256(ap),
+        **hashes,
         action_counts=dict(sorted(actions.items())),
         identifying_retained=sorted({c.keyword for c in changes
                                      if c.action == "retained" and c.keyword in WATCHED_KEYWORDS}),
         changes=[c.as_dict() for c in changes],
         leaks=leaks,
-        pixel_integrity=None if options.skipPixelCheck else pixel_integrity(ids, dds),
-        pixel_redaction=read_redaction_sidecar(ip),
+        binary_not_scanned=not_scanned,
+        pixel_integrity=pixels,
+        pixel_redaction=redaction,
     )
     return rec, ui_values
 
@@ -436,7 +450,29 @@ def write_csv(path: Path, rows, fieldnames: list[str]) -> int:
     min_gpu_limit=0,
 )
 def main(options: Namespace, inputdir: Path, outputdir: Path):
+    """
+    Entry point. Any exception not handled below is reported by class and a
+    fixed description only: a traceback can quote file paths and values, and
+    the job log must never contain those.
+    """
     print(DISPLAY_TITLE)
+    # pydicom validates values lazily, when an element is first accessed, and
+    # its warnings quote the value (e.g. an invalid PN holding a real name).
+    # Nothing may reach the job log, so silence both for the whole run.
+    warnings.simplefilter("ignore")
+    pydicom.config.settings.reading_validation_mode = pydicom.config.IGNORE
+    try:
+        audit(options, inputdir, outputdir)
+    except SystemExit:
+        raise
+    except Exception as ex:  # noqa: BLE001
+        cls, summary = sanitize_exception(ex)
+        print(f"FATAL: audit did not complete ({cls}): {summary}. Do not use any "
+              "output it may have written.", file=sys.stderr)
+        sys.exit(2)
+
+
+def audit(options: Namespace, inputdir: Path, outputdir: Path):
     started = time.time()
     options.acknowledged_tags_set = frozenset(
         t.strip() for t in options.acknowledgeRetainedTags.split(",") if t.strip()
@@ -471,12 +507,14 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
     redaction_counts: Counter = Counter()
     entity_counts: Counter = Counter()
     leak_by_keyword: Counter = Counter()
+    not_scanned: Counter = Counter()
     leak_rows: list[dict] = []
     leak_file_hashes: set = set()
     header_leak_files = 0
     reported_uid_leaks: set = set()
     anon_ui: dict[str, list] = {}           # anonymized UI value -> [count, rel, element path]
     pixel_mismatch_files: list[str] = []
+    pixel_missing_files: list[str] = []
     unlisted: list[str] = []
     total_boxes = 0
     redaction_rows: list[dict] = []
@@ -513,12 +551,16 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
                                   if "anonymized_sha256" in rec else {})})
             action_counts.update(rec.get("action_counts", {}))
             retained_identifying.update(rec.get("identifying_retained", []))
+            # keyword only (last path segment): standard elements, never PHI
+            not_scanned.update(p.rsplit(".", 1)[-1] for p in rec.get("binary_not_scanned", []))
 
             pi = rec.get("pixel_integrity")
             if pi:
                 pixel_counts[pi] += 1
                 if pi == "mismatch":
                     pixel_mismatch_files.append(h)
+                elif pi in PIXEL_ERRORS:
+                    pixel_missing_files.append(h)
             pr = rec.get("pixel_redaction")
             if pr:
                 redaction_counts[pr["status"]] += 1
@@ -548,6 +590,8 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
                 flag, extra = "FAIL ", f" leak in {len(rec['leaks'])} element(s)"
             elif pi == "mismatch":
                 flag, extra = "FAIL ", " PixelData differs between trees"
+            elif pi in PIXEL_ERRORS:
+                flag, extra = "FAIL ", f" PixelData {pi.replace('_', ' ')}"
             print(f"[{flag}] file#{i} ({h}): {st}{extra}", file=sys.stderr)
 
     # -- cross-file UID leaks: an original UID of ANY file, found anywhere --
@@ -617,6 +661,8 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
             "no original/anonymized DICOM pair was audited")
     finding("pixel_mismatch", "integrity", "error", len(pixel_mismatch_files),
             "PixelData differs between the original and anonymized files")
+    finding("pixel_missing", "integrity", "error", len(pixel_missing_files),
+            "PixelData is present in only one of the original and anonymized files")
     finding("uid_one_to_many", "integrity", "error", len(uid_one_to_many),
             "an original UID was mapped to more than one new UID")
     finding("uid_many_to_one", "integrity", "error", len(uid_many_to_one),
@@ -642,6 +688,9 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
             "a patient's dates were shifted by more than one offset")
     finding("dates_retained", "consistency", "warning", xwalk.date_actions["retained"],
             "date/time elements kept their original values")
+    finding("binary_not_scanned", "coverage", "info", sum(not_scanned.values()),
+            "standard binary elements (other than PixelData) present in anonymized files "
+            "and not searched for leaks", by_keyword=dict(sorted(not_scanned.items())))
     finding("not_dicom", "coverage", "info", status_counts["not_dicom"],
             "non-DICOM files in the original tree (not anonymized, not passed through)")
     finding("redaction_sidecar", "coverage", "info", status_counts["redaction_sidecar"],
@@ -706,11 +755,13 @@ def main(options: Namespace, inputdir: Path, outputdir: Path):
             "paths": len(path_leaks),
             "non_dicom_files": len(content_leaks),
             "non_dicom_scanned": tree_stats["non_dicom_scanned"],
+            "binary_elements_not_scanned": dict(sorted(not_scanned.items())),
             "file_hashes": sorted(leak_file_hashes),
         },
         "pixels": {
             "integrity": dict(sorted(pixel_counts.items())),
             "mismatch_file_hashes": pixel_mismatch_files,
+            "missing_file_hashes": pixel_missing_files,
             "redaction": dict(sorted(redaction_counts.items())) if sidecars_seen else {},
             "boxes": total_boxes,
             "entity_types": dict(sorted(entity_counts.items())),
