@@ -644,3 +644,29 @@ def test_unexpected_error_exits_2_without_traceback(anonymized, outdir, options,
     err = capsys.readouterr().err
     assert "FATAL: audit did not complete (OSError)" in err
     assert str(outdir) not in err and "Traceback" not in err
+
+
+
+# --------------------------------------------------------------------------
+# Review 2 (68b6d44)
+# --------------------------------------------------------------------------
+
+def test_name_folders_with_digits_leak(tmp_path, outdir, options):
+    """Exports often append a counter or date: SMITH1/, DOE20240301/."""
+    root = tmp_path / "in"
+    make_dcm(root / ORIG / "SMITH1/1.dcm", name="Smith^Ann", pid="MRN009", private=False)
+    make_dcm(root / ORIG / "DOE20240301/1.dcm", private=False)
+    anonymize_tree(root / ORIG, root / ANON)
+    assert run(options, root, outdir) == 1
+    assert summary(outdir)["leaks"]["paths"] == 2
+    hits = {(r["file"], r["matched"]) for r in rows(outdir / "restricted/leaks.csv")
+            if r["kind"] == "path"}
+    assert {("SMITH1/1.dcm", "SMITH"), ("DOE20240301/1.dcm", "DOE")} <= hits
+
+
+@pytest.mark.parametrize("side", [ORIG, ANON])
+def test_trailing_zero_padding_audits_normally(anonymized, outdir, options, side):
+    f = anonymized / side / "p02/s1/1.dcm"
+    f.write_bytes(f.read_bytes() + b"\x00\x00\x00")
+    assert run(options, anonymized, outdir) == 0
+    assert _statuses(outdir)["p02/s1/1.dcm"] == "audited"

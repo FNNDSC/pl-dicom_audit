@@ -150,6 +150,10 @@ def expected_pixel_bytes(ds: Dataset) -> Optional[int]:
     Byte length native (uncompressed) PixelData must have, from Rows,
     Columns, SamplesPerPixel, BitsAllocated and NumberOfFrames. None when it
     cannot be computed (encapsulated transfer syntax, missing attributes).
+
+    With 4:2:2 chroma subsampling (YBR_FULL_422, YBR_PARTIAL_422), each pair
+    of pixels shares one Cb and one Cr sample, so 3 samples per pixel take
+    only 2 samples' worth of bytes (PS3.5 section 8.2.1).
     """
     meta = getattr(ds, "file_meta", None)
     ts = getattr(meta, "TransferSyntaxUID", None) if meta is not None else None
@@ -162,6 +166,9 @@ def expected_pixel_bytes(ds: Dataset) -> Optional[int]:
         frames = int(ds.get("NumberOfFrames", 1) or 1)
     except (AttributeError, TypeError, ValueError):
         return None
+    pi = str(ds.get("PhotometricInterpretation", "") or "").strip().upper()
+    if spp == 3 and pi.endswith("_422"):
+        spp = 2
     n_bits = rows * cols * spp * frames * bits
     return (n_bits + 7) // 8
 
@@ -169,7 +176,17 @@ def expected_pixel_bytes(ds: Dataset) -> Optional[int]:
 UNDEFINED_LENGTH = 0xFFFFFFFF
 
 
-def check_not_truncated(ds: pydicom.dataset.FileDataset, file_size: int) -> None:
+def _only_zero_bytes(path: Path, start: int) -> bool:
+    """True if every byte of the file from `start` to the end is 0x00."""
+    with open(path, "rb") as fh:
+        fh.seek(start)
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            if chunk.strip(b"\x00"):
+                return False
+    return True
+
+
+def check_not_truncated(ds: pydicom.dataset.FileDataset, path: Path) -> None:
     """
     pydicom stops quietly at end of file, so a truncated file reads "fine".
     Right after dcmread every top-level element is still raw and carries its
@@ -177,7 +194,9 @@ def check_not_truncated(ds: pydicom.dataset.FileDataset, file_size: int) -> None
 
     * an element whose value is shorter than its declared length (cut
       mid-value), and
-    * bytes left over after the last element (cut mid-element-header).
+    * bytes left over after the last element (cut mid-element-header),
+      unless they are all zero: stray trailing padding left by some writers
+      and transfer tools is not truncation (no element header is all zeros).
 
     A cut exactly on an element boundary is a valid shorter file and cannot
     be told apart here; the pixel-presence check and the diff catch those.
@@ -193,7 +212,10 @@ def check_not_truncated(ds: pydicom.dataset.FileDataset, file_size: int) -> None
     if not raws or (ts is not None and ts.is_deflated):
         return
     last = max(raws, key=lambda r: r.value_tell)
-    if last.length != UNDEFINED_LENGTH and last.value_tell + last.length != file_size:
+    if last.length == UNDEFINED_LENGTH:
+        return
+    end = last.value_tell + last.length
+    if end != path.stat().st_size and not _only_zero_bytes(path, end):
         raise TruncatedDicomError("file ends part-way through an element")
 
 
@@ -223,7 +245,7 @@ def read_dicom(path: Path) -> pydicom.dataset.FileDataset:
     meta = getattr(ds, "file_meta", None)
     if meta is None or any(not hasattr(meta, k) for k in _REQUIRED_FILE_META):
         raise MalformedDicomError("missing mandatory File Meta Information")
-    check_not_truncated(ds, path.stat().st_size)     # before anything converts raw elements
+    check_not_truncated(ds, path)     # before anything converts raw elements
     check_complete(ds)
     return ds
 
@@ -495,6 +517,7 @@ def _text_values(elem) -> list[str]:
 
 
 _WORDCHAR = r"[^\W_]"      # a Unicode letter or digit (underscore is a separator)
+_LETTER = r"[^\W\d_]"      # a Unicode letter
 
 
 def is_word(token: str) -> bool:
@@ -506,14 +529,19 @@ def token_pattern(token: str) -> str:
     """
     Regex for one needle (already upper-case).
 
-    * A single word (letters/digits only: a name component such as "ANN",
-      an ID such as "MRN001" or "1234", a date) matches only as a whole
-      word, i.e. not run into other letters or digits. So "ANN" is not found
-      in "SCANNER", "ZED" not in "ANONYMIZED", "1234" not in a hex hash;
-      "DOE" is still found in "Doe_Jane/", "follow-up doe" and "DOE^JANE".
+    * Letters only (a name component such as "ANN" or "DOE"): must not run
+      into other LETTERS. Digits and punctuation are boundaries, because
+      exports often name folders "SMITH1/" or "DOE20240301/". So "ANN" is not
+      found in "SCANNER" and "ZED" not in "ANONYMIZED", but "DOE" is found in
+      "DOE20240301/", "Doe_Jane/", "follow-up doe" and "DOE^JANE".
+    * Letters and digits (an ID such as "MRN001", a number such as "1234",
+      a date): must not run into other letters OR digits, so a short number
+      is not found inside a hex hash, a longer number or a timestamp.
     * Anything else (a full name with "^", an institution with spaces, a
       UID with dots) is a plain substring.
     """
+    if token.isalpha():
+        return rf"(?<!{_LETTER}){re.escape(token)}(?!{_LETTER})"
     if is_word(token):
         return rf"(?<!{_WORDCHAR}){re.escape(token)}(?!{_WORDCHAR})"
     return re.escape(token)

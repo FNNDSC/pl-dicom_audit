@@ -245,8 +245,17 @@ def test_token_in():
     ("MRN001", "PRIVATE NOTE MRN001", True),
     ("JOSÉ", "PATIENT JOSÉ", True),                  # Unicode letters are word characters
     ("JOSÉ", "JOSÉE", False),
-    # fused names are a documented miss
+    # review 2: digits are boundaries for letters-only tokens
+    ("SMITH", "SMITH1/1.DCM", True),
+    ("DOE", "DOE20240301/1.DCM", True),
+    ("ANN", "2ANN", True),
+    ("ANN", "SCANNER2", False),                      # still run into letters
+    # tokens containing digits keep the letter/digit boundary (hex hashes)
+    ("MRN001", "MRN001/1.DCM", True),
+    ("1234", "9A1234BC", False),
+    # fused with letters: documented misses
     ("DOE", "DOEJANE", False),
+    ("MRN001", "SCANMRN001", False),
     # multi-word / punctuated values stay substrings
     ("DOE^JANE", "XDOE^JANEX", True),
     ("GENERAL HOSPITAL", "THEGENERAL HOSPITALS", True),
@@ -515,3 +524,50 @@ def test_patient_with_no_dates():
     assert x.patient_date_handling(x.patients["P1"]) == ("no dates present", None, True)
     row = next(x.rows_patients())
     assert (row["date_handling"], row["date_offset_days"]) == ("no dates present", "")
+
+
+# --------------------------------------------------------------------------
+# Review 2: trailing padding and 4:2:2 pixel size
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("n", [1, 3, 4, 8, 1000])
+def test_trailing_zero_padding_is_not_truncation(tmp_path, n):
+    p = make_dcm(tmp_path / "a.dcm")
+    p.write_bytes(p.read_bytes() + b"\x00" * n)
+    read_dicom(p)
+
+
+@pytest.mark.parametrize("tail", [b"\x01", b"\x00\x00\x07", b"\x08\x00"])
+def test_trailing_non_zero_bytes_still_rejected(tmp_path, tail):
+    p = make_dcm(tmp_path / "a.dcm")
+    p.write_bytes(p.read_bytes() + tail)
+    with pytest.raises(TruncatedDicomError):
+        read_dicom(p)
+
+
+def _ybr_422(path, n_bytes):
+    p = make_dcm(path)
+    ds = read_dicom(p)
+    ds.Rows = ds.Columns = 16
+    ds.SamplesPerPixel = 3
+    ds.PhotometricInterpretation = "YBR_FULL_422"
+    ds.PlanarConfiguration = 0
+    ds.PixelData = bytes(n_bytes)
+    ds.save_as(str(p), write_like_original=False)
+    return p
+
+
+def test_ybr_422_native_pixel_size(tmp_path):
+    p = _ybr_422(tmp_path / "a.dcm", 16 * 16 * 2)        # 4:2:2: 2 bytes per pixel at 8 bits
+    ds = read_dicom(p)                                    # valid file is accepted
+    assert expected_pixel_bytes(ds) == 16 * 16 * 2
+    ds.PhotometricInterpretation = "YBR_PARTIAL_422"
+    assert expected_pixel_bytes(ds) == 16 * 16 * 2
+    ds.PhotometricInterpretation = "RGB"
+    assert expected_pixel_bytes(ds) == 16 * 16 * 3
+
+
+def test_ybr_422_short_pixel_data_still_rejected(tmp_path):
+    p = _ybr_422(tmp_path / "a.dcm", 16 * 16 * 2 - 10)
+    with pytest.raises(TruncatedDicomError):
+        read_dicom(p)

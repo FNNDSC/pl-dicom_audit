@@ -179,9 +179,11 @@ Files are also checked for completeness when read. pydicom reads a truncated
 file without complaint and returns whatever it parsed before the end, so the
 plugin itself rejects, as `unreadable`:
 
-* files that end part-way through an element;
+* files that end part-way through an element (trailing zero bytes after the
+  last element are accepted as padding, not truncation);
 * native (uncompressed) PixelData shorter than Rows × Columns × frames
-  require;
+  require (4:2:2 photometric interpretations such as `YBR_FULL_422` are
+  sized at 2 samples per pixel);
 * datasets without a SOP Class/Instance UID.
 
 A file cut exactly on an element boundary is indistinguishable from a valid
@@ -233,11 +235,14 @@ values that survived byte-for-byte.
 
 How a value matches depends on its shape:
 
-* **A single word** (letters and digits only: a name component like `ANN`, an
-  ID like `MRN001`, a date) matches only as a **whole word**: not run into
-  other letters or digits. So `DOE` is found in `Doe_Jane/`, `follow-up doe`
-  and `DOE^JANE`, but `ANN` is not found in `SCANNER`, `ZED` not in
-  `ANONYMIZED`, and a short accession number not inside a hex hash.
+* **Letters only** (a name component like `ANN` or `DOE`) must not run into
+  other **letters**. Digits and punctuation count as boundaries, since exports
+  often name folders `SMITH1/` or `DOE20240301/`. So `DOE` is found in
+  `DOE20240301/`, `Doe_Jane/`, `follow-up doe` and `DOE^JANE`, but `ANN` is
+  not found in `SCANNER` and `ZED` is not found in `ANONYMIZED`.
+* **Letters and digits** (an ID like `MRN001`, a number, a date) must not run
+  into other letters **or** digits, so a short accession number is not found
+  inside a hex hash, a longer number or a timestamp.
 * **Anything else** (a full name with `^`, an institution with spaces, a UID
   with dots) matches as a substring.
 
@@ -482,9 +487,14 @@ same rules. Tests assert this for clean and leaking runs alike.
   than EncapsulatedDocument (overlays, LUTs, icon images) are not decoded as
   text (see `binary_not_scanned`). Text encoded as UTF-16 or compressed
   inside a private blob is not found either.
-* **Names run together.** Whole-word matching means a name component fused
-  with other letters (`DoeJane`, `JDoe`) is not matched, although
-  `Doe_Jane`, `Doe Jane` and `DOE^JANE` are.
+* **Encapsulated PDFs are mostly opaque.** EncapsulatedDocument is decoded
+  as latin-1 and scanned, which works for embedded CDA/XML reports. PDF page
+  text is usually Flate-compressed, though, so a name inside an encapsulated
+  PDF will rarely be found. Treat a clean scan of a PDF as unverified.
+* **Names run together with letters.** A name component fused with other
+  letters (`DoeJane`, `JDoe`) is not matched, nor is an ID fused with letters
+  (`scanMRN001` when the ID is `MRN001`). `Doe_Jane`, `Doe Jane`, `DOE^JANE`,
+  `SMITH1` and `DOE20240301` are matched.
 * **Scope of the UID mapping.** The mapping covers one anonymizer run, which
   matches pl-dicom_anonymize's own consistency scope.
 * **Inherits the sensitivity of its input.** The plugin cannot reduce the
