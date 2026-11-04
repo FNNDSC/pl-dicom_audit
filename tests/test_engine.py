@@ -1,0 +1,693 @@
+"""Unit tests: audit_engine functions and the CLI's pure helpers."""
+
+import hashlib
+import json
+from pathlib import Path
+
+import pydicom
+import pytest
+from pydicom.dataset import Dataset
+from pydicom.sequence import Sequence
+from pydicom.uid import generate_uid
+
+from audit_engine import (
+    Change,
+    Crosswalk,
+    MalformedDicomError,
+    NeedleIndex,
+    classify_date,
+    diff_datasets,
+    diff_file,
+    find_residual_phi,
+    find_residual_phi_in_file,
+    token_in,
+    PIXEL_ERRORS,
+    TruncatedDicomError,
+    expected_pixel_bytes,
+    looks_like_headerless_dicom,
+    mask_hex,
+    unscanned_binary,
+    is_dicom_file,
+    phi_needles,
+    pixel_integrity,
+    read_dicom,
+    read_redaction_sidecar,
+    relpath_hash,
+    render,
+    sanitize_exception,
+    uid_needles,
+)
+from conftest import make_dcm
+from dicom_audit import Entry, LayoutError, classify, collect_ui_values, locate_trees
+
+
+def ds_with(**kw):
+    ds = Dataset()
+    for k, v in kw.items():
+        setattr(ds, k, v)
+    return ds
+
+
+def by_path(changes):
+    return {c.path: c for c in changes}
+
+
+# --------------------------------------------------------------------------
+# render / helpers
+# --------------------------------------------------------------------------
+
+def test_render_text_multivalue_and_binary():
+    ds = ds_with(PatientName="Doe^Jane", ImageType=["ORIGINAL", "PRIMARY"])
+    ds.add_new(0x00091001, "OB", b"\x01\x02\x03")
+    assert render(ds["PatientName"]) == "Doe^Jane"
+    assert render(ds["ImageType"]) == ["ORIGINAL", "PRIMARY"]
+    assert render(ds[0x00091001]) == {"sha256": hashlib.sha256(b"\x01\x02\x03").hexdigest(),
+                                      "length": 3}
+
+
+def test_relpath_hash_matches_pl_dicom_anonymize():
+    # same formula as pl-dicom_anonymize's safety.relpath_hash
+    assert relpath_hash(Path("a/b.dcm")) == hashlib.sha256(b"a/b.dcm").hexdigest()[:12]
+
+
+def test_sanitize_exception_never_quotes_message():
+    cls, msg = sanitize_exception(ValueError("Doe^Jane is not a valid date"))
+    assert cls == "ValueError" and "Doe" not in msg
+    cls, msg = sanitize_exception(RuntimeError("MRN001"))
+    assert "MRN001" not in msg
+
+
+def test_is_dicom_and_strict_read(tmp_path):
+    good = make_dcm(tmp_path / "good.dcm")
+    junk = tmp_path / "junk.dcm"
+    junk.write_bytes(b"\0" * 128 + b"DICM" + b"garbage")
+    text = tmp_path / "t.txt"
+    text.write_text("hello")
+    assert is_dicom_file(good) and is_dicom_file(junk) and not is_dicom_file(text)
+    assert read_dicom(good).PatientID == "MRN001"
+    with pytest.raises(MalformedDicomError):
+        read_dicom(junk)
+
+
+# --------------------------------------------------------------------------
+# diff
+# --------------------------------------------------------------------------
+
+def test_diff_actions():
+    o = ds_with(PatientName="Doe^Jane", PatientID="MRN001", AccessionNumber="ACC1",
+                Modality="MR", StudyDescription="")
+    n = ds_with(PatientName="ANON", PatientID="", Modality="MR", StudyDescription="",
+                PatientSex="O")
+    ch = by_path(diff_datasets(o, n))
+    assert (ch["PatientName"].action, ch["PatientName"].original, ch["PatientName"].new) == (
+        "replaced", "Doe^Jane", "ANON")
+    assert ch["PatientID"].action == "emptied"
+    assert (ch["AccessionNumber"].action, ch["AccessionNumber"].original) == ("removed", "ACC1")
+    assert ch["PatientSex"].action == "added"
+    assert (ch["Modality"].action, ch["Modality"].new) == ("retained", "MR")
+    assert "StudyDescription" not in ch          # empty and unchanged: nothing to record
+
+
+def test_diff_recurses_sequences_and_counts_items():
+    o = Dataset()
+    o.ReferencedImageSequence = Sequence([ds_with(ReferencedSOPInstanceUID="1.2.3"),
+                                          ds_with(ReferencedSOPInstanceUID="1.2.4")])
+    n = Dataset()
+    n.ReferencedImageSequence = Sequence([ds_with(ReferencedSOPInstanceUID="9.9.9")])
+    ch = by_path(diff_datasets(o, n))
+    c = ch["ReferencedImageSequence[0].ReferencedSOPInstanceUID"]
+    assert (c.action, c.original, c.new) == ("replaced", "1.2.3", "9.9.9")
+    assert (ch["ReferencedImageSequence"].action, ch["ReferencedImageSequence"].original,
+            ch["ReferencedImageSequence"].new) == ("items_removed", 2, 1)
+
+
+def test_diff_skips_pixel_data_and_includes_file_meta(tmp_path):
+    a = read_dicom(make_dcm(tmp_path / "a.dcm"))
+    b = read_dicom(make_dcm(tmp_path / "b.dcm"))
+    b.PixelData = bytes(64)
+    ch = by_path(diff_file(a, b))
+    assert "PixelData" not in ch
+    assert ch["file_meta.MediaStorageSOPInstanceUID"].action == "replaced"
+
+
+def test_change_as_dict_omits_absent_values():
+    d = Change("X", "(0008,0050)", "AccessionNumber", "SH", "removed", original="A").as_dict()
+    assert d == {"path": "X", "tag": "(0008,0050)", "keyword": "AccessionNumber", "vr": "SH",
+                 "action": "removed", "original": "A"}
+
+
+# --------------------------------------------------------------------------
+# dates
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("vr,action,orig,new,expected", [
+    ("DA", "replaced", "20240301", "00010101", ("replaced_dummy", None)),
+    ("TM", "replaced", "101500", "000000.00", ("replaced_dummy", None)),
+    ("DA", "replaced", "20240301", "20231123", ("shifted", -99)),
+    ("DT", "replaced", "20240301101500", "20240311101500", ("shifted", 10)),
+    ("TM", "replaced", "101500", "120000", ("replaced", None)),
+    ("DA", "retained", "20240301", "20240301", ("retained", 0)),
+    ("DA", "emptied", "20240301", "", ("emptied", None)),
+    ("DA", "removed", "20240301", None, ("removed", None)),
+])
+def test_classify_date(vr, action, orig, new, expected):
+    assert classify_date(Change("StudyDate", "t", "StudyDate", vr, action, orig, new)) == expected
+
+
+# --------------------------------------------------------------------------
+# leak scan
+# --------------------------------------------------------------------------
+
+def test_phi_needles_split_names_and_respect_min_length():
+    ds = ds_with(PatientName="Doe^Jane^Q", PatientID="AB", PatientBirthDate="19800101")
+    n = phi_needles(ds, 3)
+    assert {"DOE^JANE^Q", "DOE", "JANE", "19800101"} <= set(n)
+    assert "Q" not in n and "AB" not in n
+    assert n["DOE"] == "PatientName"
+
+
+def test_uid_needles_include_file_meta(tmp_path):
+    ds = read_dicom(make_dcm(tmp_path / "a.dcm"))
+    n = uid_needles(ds)
+    assert n[ds.StudyInstanceUID] == "StudyInstanceUID"
+    assert ds.file_meta.MediaStorageSOPInstanceUID in n
+    assert ds.SOPClassUID not in n                 # class UIDs are not identifying
+
+
+def test_find_residual_text_case_insensitive_and_nested():
+    deid = Dataset()
+    deid.StudyDescription = "follow-up for doe"
+    deid.RequestAttributesSequence = Sequence([ds_with(RequestedProcedureDescription="MRN001 knee")])
+    hits = find_residual_phi(deid, {"DOE": "PatientName", "MRN001": "PatientID"}, frozenset())
+    assert {(h["path"], h["matched"]) for h in hits} == {
+        ("StudyDescription", "DOE"),
+        ("RequestAttributesSequence[0].RequestedProcedureDescription", "MRN001")}
+
+
+def test_find_residual_acknowledged_skipped():
+    deid = ds_with(InstitutionName="General Hospital")
+    assert find_residual_phi(deid, {"GENERAL HOSPITAL": "InstitutionName"},
+                             frozenset({"InstitutionName"})) == []
+
+
+def test_find_residual_uid_exact_and_in_text():
+    uid = generate_uid()
+    deid = ds_with(StudyInstanceUID=uid, StudyComments=f"see {uid}")
+    hits = find_residual_phi(deid, {}, frozenset(), uids={uid: "StudyInstanceUID"})
+    assert {(h["path"], h["kind"]) for h in hits} == {("StudyInstanceUID", "uid"),
+                                                      ("StudyComments", "uid")}
+
+
+def test_find_residual_scans_un_private_bytes_not_pixels():
+    deid = Dataset()
+    deid.add_new(0x00111001, "UN", b"note about MRN001")
+    deid.add_new(0x7FE00010, "OB", b"MRN001")         # PixelData never searched
+    hits = find_residual_phi(deid, {"MRN001": "PatientID"}, frozenset())
+    assert [h["path"] for h in hits] == ["(0011,1001)"]
+
+
+def test_find_residual_in_file_scans_file_meta(tmp_path):
+    ident = read_dicom(make_dcm(tmp_path / "a.dcm"))
+    deid = read_dicom(make_dcm(tmp_path / "b.dcm", name="", pid="", acc="",
+                               birth="", private=False))
+    deid.file_meta.MediaStorageSOPInstanceUID = ident.SOPInstanceUID
+    hits = find_residual_phi_in_file(deid, ident, 3, frozenset())
+    assert any(h["path"] == "file_meta.MediaStorageSOPInstanceUID" for h in hits)
+
+
+def test_numeric_values_must_stand_alone():
+    hits = lambda text: find_residual_phi(ds_with(StudyComments=text), {"1234": "AccessionNumber"},
+                                          frozenset())
+    assert hits("accession 1234 reviewed")
+    assert hits("ACC-1234")
+    assert not hits("ref a01234ff")                   # inside a hex string
+    assert not hits("12345")                          # inside a longer number
+    idx = NeedleIndex()
+    idx.add({"1234": "AccessionNumber", "DOE": "PatientName"})
+    assert idx.search('"path_hash": "9a1234bc"') == []
+    assert idx.search("scans/1234/doe_jane.dcm") == [("1234", "AccessionNumber"),
+                                                    ("DOE", "PatientName")]
+
+
+def test_token_in():
+    assert token_in("19800101", "BORN 19800101")
+    assert not token_in("19800101", "X198001012")
+
+
+# expected = (in headers and non-DICOM content, in relative paths)
+@pytest.mark.parametrize("token,hay,expected", [
+    # the round-1 false positives: never inside other letters
+    ("ANN", "ACME SCANNER CO.", (False, False)),
+    ("ZED", "ANONYMIZED", (False, False)),
+    ("ANN", "SCANNER2", (False, False)),
+    # real leaks found everywhere
+    ("DOE", "DOE_JANE/S1/1.DCM", (True, True)),
+    ("DOE", "FOLLOW-UP DOE KNEE", (True, True)),
+    ("DOE", "DOE^JANE", (True, True)),
+    ("MRN001", "PRIVATE NOTE MRN001", (True, True)),
+    ("JOSÉ", "PATIENT JOSÉ", (True, True)),
+    ("JOSÉ", "JOSÉE", (False, False)),
+    # round 2: names next to digits, but only in paths
+    ("SMITH", "SMITH1/1.DCM", (False, True)),
+    ("DOE", "DOE20240301/1.DCM", (False, True)),
+    # round 3: names inside hex hashes and scanner values never match
+    ("ADA", '"PATH_HASH": "A90ADA7AE450"', (False, False)),
+    ("ADA", "SCANS/A90ADA7AE450.DCM", (False, False)),        # hex-named file
+    ("ADA", "ADA1/1.DCM", (False, True)),
+    ("EFE", "E1E437B7-F735-EFE6-08D1-80113E940BB4.DCM", (False, False)),   # UUID-named file
+    ("ADA", "ADA1/E1E437B7-F735-EFE6-08D1-80113E940BB4.DCM", (False, True)),
+    # scanner values: no longer matched in headers or content; a series folder
+    # with the same name in a path is still matched (trade-off, see README)
+    ("TSE", "T2TSE3D", (False, True)),
+    ("SAG", "SAG2", (False, True)),
+    ("VIDA", "VIDA3T", (False, True)),
+    # IDs and numbers: letter/digit boundary everywhere (hex hashes, longer numbers)
+    ("MRN001", "MRN001/1.DCM", (True, True)),
+    ("1234", "9A1234BC", (False, False)),
+    ("1234", "P1234/", (False, False)),                       # documented miss
+    ("AB12CD34", "ACC/AB12CD34/1.DCM", (True, True)),        # hex-looking ID not masked
+    # multi-word / punctuated values stay substrings
+    ("DOE^JANE", "XDOE^JANEX", (True, True)),
+    ("GENERAL HOSPITAL", "THEGENERAL HOSPITALS", (True, True)),
+    # fused with letters: documented misses
+    ("DOE", "DOEJANE", (False, False)),
+    ("MRN001", "SCANMRN001", (False, False)),
+])
+def test_whole_word_matching(token, hay, expected):
+    in_content, in_path = expected
+    assert token_in(token, hay) is in_content
+    idx = NeedleIndex()
+    idx.add({token: "PatientName"})
+    assert bool(idx.search(hay)) is in_content
+    assert bool(idx.search(hay, path=True)) is in_path
+
+
+def test_mask_hex_keeps_names_and_ids():
+    assert mask_hex("A90ADA7AE450.DCM") == " " * 12 + ".DCM"
+    assert mask_hex("DOE20240301/ADA1/DEADBEEF/19800101") == "DOE20240301/ADA1/DEADBEEF/19800101"
+    assert mask_hex("E1E437B7-F735-EFE6-08D1-80113E940BB4.DCM") == " " * 36 + ".DCM"
+
+
+def test_needle_index():
+    idx = NeedleIndex()
+    assert idx.search("anything") == []
+    idx.add({"DOE": "PatientName", "MRN001": "PatientID"})
+    idx.add({"DOE": "OtherPatientNames"})            # first source wins
+    assert sorted(idx.search("Doe_Jane/mrn001/doe.dcm")) == [("DOE", "PatientName"),
+                                                             ("MRN001", "PatientID")]
+    assert idx.search("nothing here") == []
+
+
+# --------------------------------------------------------------------------
+# pixels
+# --------------------------------------------------------------------------
+
+def test_pixel_integrity():
+    a, b = Dataset(), Dataset()
+    assert pixel_integrity(a, b) == "absent_both"
+    a.PixelData = b"\x01"
+    assert pixel_integrity(a, b) == "absent_in_anonymized"
+    assert pixel_integrity(b, a) == "absent_in_original"
+    assert pixel_integrity(a, b, compare=False) == "absent_in_anonymized"   # presence always checked
+    b.PixelData = b"\x01"
+    assert pixel_integrity(a, b) == "match"
+    b.PixelData = b"\x02"
+    assert pixel_integrity(a, b) == "mismatch"
+    assert pixel_integrity(a, b, compare=False) == "not_compared"
+    assert PIXEL_ERRORS == {"mismatch", "absent_in_anonymized", "absent_in_original"}
+
+
+def test_read_redaction_sidecar(tmp_path):
+    dcm = tmp_path / "1.dcm"
+    assert read_redaction_sidecar(dcm)["status"] == "no_sidecar"
+    (tmp_path / "1.json").write_text("[]")
+    assert read_redaction_sidecar(dcm)["status"] == "no_detections"
+    (tmp_path / "1.json").write_text(json.dumps([{"entity_type": "PERSON", "score": 0.7}]))
+    r = read_redaction_sidecar(dcm)
+    assert (r["status"], r["boxes"], r["entity_types"], r["max_score"]) == (
+        "redacted", 1, {"PERSON": 1}, 0.7)
+    (tmp_path / "1.json").write_text("{not json")
+    assert read_redaction_sidecar(dcm)["status"] == "unreadable_sidecar"
+
+
+# --------------------------------------------------------------------------
+# crosswalk
+# --------------------------------------------------------------------------
+
+def _uid_change(kw, o, n, action="replaced"):
+    return Change(kw, "t", kw, "UI", action, o, n)
+
+
+def test_crosswalk_uid_conflicts_and_broken_references():
+    x = Crosswalk()
+    o = ds_with(PatientID="P1")
+    x.add_file("a", o, Dataset(), [_uid_change("StudyInstanceUID", "1.1", "9.1"),
+                                   _uid_change("ReferencedSOPInstanceUID", "1.5", "", "emptied")])
+    x.add_file("b", o, Dataset(), [_uid_change("StudyInstanceUID", "1.1", "9.2"),
+                                   _uid_change("SeriesInstanceUID", "1.3", "9.1")])
+    assert x.uid_conflicts() == (["1.1"], ["9.1"])
+    assert x.broken_references == {"ReferencedSOPInstanceUID": 1}
+
+
+def test_crosswalk_pseudonyms():
+    x = Crosswalk()
+    x.add_file("a", ds_with(PatientID="P1"), ds_with(PatientID="X1"), [])
+    x.add_file("b", ds_with(PatientID="P1"), ds_with(PatientID="X2"), [])
+    x.add_file("c", ds_with(PatientID="P2"), ds_with(PatientID="X2"), [])
+    assert x.pseudonym_findings() == (["P1"], ["X2"])
+
+
+def test_crosswalk_patient_key_without_id():
+    assert Crosswalk.patient_key(ds_with(PatientName="Doe^Jane")) == \
+        "<no PatientID; name=Doe^Jane>"
+
+
+def test_crosswalk_date_offsets():
+    x = Crosswalk()
+    p = ds_with(PatientID="P1")
+    d = lambda o, n: Change("StudyDate", "t", "StudyDate", "DA", "replaced", o, n)
+    x.add_file("a", p, Dataset(), [d("20240301", "20240201")])
+    assert x.patient_date_handling(x.patients["P1"])[1:] == (-29, True)
+    x.add_file("b", p, Dataset(), [d("20240301", "20240202")])
+    assert x.patient_date_handling(x.patients["P1"])[1:] == (None, False)
+
+
+# --------------------------------------------------------------------------
+# CLI helpers: classification and layout
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("orig,anon,anon_status,expected", [
+    ("dicom", "dicom", "processed", "pair"),
+    ("dicom", "dicom", None, "pair"),
+    ("dicom", None, "failed", "failed_deidentification"),
+    ("dicom", None, "processed", "missing_anonymized"),
+    ("dicom", None, None, "not_deidentified"),
+    ("dicom", "other", "processed", "anonymized_not_dicom"),
+    ("other", None, "skipped_not_dicom", "not_dicom"),
+    ("other", "other", "copied_non_dicom", "non_dicom_copied"),
+    ("other", "dicom", None, "unmatched_anonymized"),
+    (None, "dicom", None, "unmatched_anonymized"),
+    (None, "other", None, "extra_anonymized_file"),
+    (None, None, "processed", "missing_original"),
+])
+def test_classify(orig, anon, anon_status, expected):
+    assert classify(Entry("x/1.dcm", orig, anon, anon_status), set()) == expected
+
+
+def test_classify_sidecar():
+    assert classify(Entry("x/1.json", "other", None, None), {"x/1.json"}) == "redaction_sidecar"
+
+
+def test_collect_ui_values_recurses(tmp_path):
+    ds = read_dicom(make_dcm(tmp_path / "a.dcm"))
+    paths = dict(collect_ui_values(ds))
+    assert paths["StudyInstanceUID"] == ds.StudyInstanceUID
+    assert paths["ReferencedImageSequence[0].ReferencedSOPInstanceUID"] == ds.SOPInstanceUID
+
+
+def test_locate_trees(tmp_path):
+    (tmp_path / "orig").mkdir()
+    (tmp_path / "anon").mkdir()
+    (tmp_path / "anon/deidentification_summary.json").write_text("{}")
+    assert locate_trees(tmp_path, "", "") == ((tmp_path / "orig").resolve(),
+                                              (tmp_path / "anon").resolve())
+    with pytest.raises(LayoutError):
+        locate_trees(tmp_path, "anon", "anon")
+    with pytest.raises(LayoutError):
+        locate_trees(tmp_path, "orig", "missing")
+
+
+# --------------------------------------------------------------------------
+# Review fixes: truncation, empty datasets, headerless DICOM
+# --------------------------------------------------------------------------
+
+def _element_boundaries(path):
+    """Byte offsets where the File Meta or a top-level element ends."""
+    import warnings
+    from pydicom.dataelem import RawDataElement
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ds = pydicom.dcmread(str(path))
+    meta_end = 132 + 12 + ds.file_meta.FileMetaInformationGroupLength
+    return {meta_end} | {r.value_tell + r.length for r in ds._dict.values()
+                         if isinstance(r, RawDataElement)}
+
+
+def test_truncation_detected_at_every_cut(tmp_path):
+    """Cut a valid file at every byte. Each cut is either rejected, or lands
+    exactly on an element boundary (a valid shorter file)."""
+    good = make_dcm(tmp_path / "good.dcm")
+    raw = good.read_bytes()
+    boundaries = _element_boundaries(good)
+    cut_file = tmp_path / "cut.dcm"
+    accepted = []
+    for cut in range(132, len(raw)):
+        cut_file.write_bytes(raw[:cut])
+        try:
+            read_dicom(cut_file)
+        except Exception:
+            continue
+        accepted.append(cut)
+    assert accepted, "expected some boundary cuts to read as valid shorter files"
+    assert set(accepted) <= boundaries
+    cut_file.write_bytes(raw)
+    read_dicom(cut_file)                                   # the intact file still reads
+
+
+def test_short_native_pixel_data_rejected(tmp_path):
+    p = make_dcm(tmp_path / "a.dcm")
+    ds = read_dicom(p)
+    assert expected_pixel_bytes(ds) == 64
+    ds.PixelData = bytes(10)                               # well-formed element, too short
+    ds.save_as(str(p), write_like_original=False)
+    with pytest.raises(TruncatedDicomError):
+        read_dicom(p)
+
+
+def test_expected_pixel_bytes_unknown_for_compressed(tmp_path):
+    ds = read_dicom(make_dcm(tmp_path / "a.dcm"))
+    ds.file_meta.TransferSyntaxUID = "1.2.840.10008.1.2.4.50"   # JPEG Baseline
+    assert expected_pixel_bytes(ds) is None
+    ds.file_meta.TransferSyntaxUID = "1.2.840.10008.1.2.1"
+    ds.NumberOfFrames = 3
+    ds.BitsAllocated = 1
+    assert expected_pixel_bytes(ds) == (8 * 8 * 3 + 7) // 8
+
+
+def test_dataset_without_sop_uids_is_accepted(tmp_path):
+    """Minimal but parseable objects (DICOMDIR, private-sequence fixtures) are
+    audited; truncation is detected separately."""
+    p = make_dcm(tmp_path / "a.dcm")
+    ds = read_dicom(p)
+    del ds.SOPClassUID
+    del ds.SOPInstanceUID
+    ds.save_as(str(p), write_like_original=False)
+    assert "SOPClassUID" not in read_dicom(p)
+
+
+def test_empty_dataset_is_readable(tmp_path):
+    """An all-private original legitimately anonymizes to an empty dataset."""
+    p = make_dcm(tmp_path / "a.dcm")
+    ds = read_dicom(p)
+    for elem in list(ds):
+        del ds[elem.tag]
+    ds.save_as(str(p), write_like_original=False)
+    assert len(read_dicom(p)) == 0
+
+
+def test_placeholder_values_are_not_needles():
+    ds = ds_with(PatientName="Anonymized", OtherPatientNames="Test^Phantom",
+                 InstitutionName="Unknown")
+    assert phi_needles(ds, 3) == {"TEST^PHANTOM": "OtherPatientNames"}
+    ds = ds_with(PatientName="Testa^Anona")            # real names that merely start alike
+    assert {"TESTA", "ANONA"} <= set(phi_needles(ds, 3))
+
+
+def test_looks_like_headerless_dicom(tmp_path):
+    from pydicom.filebase import DicomBytesIO
+    from pydicom.filewriter import write_dataset
+    ds = read_dicom(make_dcm(tmp_path / "a.dcm"))
+    bio = DicomBytesIO()
+    bio.is_little_endian, bio.is_implicit_VR = True, False
+    write_dataset(bio, ds)
+    headerless = tmp_path / "IM0001"
+    headerless.write_bytes(bio.getvalue())
+    text = tmp_path / "notes.txt"
+    text.write_text("Patient Doe, seen 2024-03-01")
+    junk = tmp_path / "blob.bin"
+    junk.write_bytes(bytes(range(256)) * 4)
+    assert looks_like_headerless_dicom(headerless)
+    assert not is_dicom_file(headerless)
+    assert not looks_like_headerless_dicom(text)
+    assert not looks_like_headerless_dicom(junk)
+
+
+# --------------------------------------------------------------------------
+# Review fixes: binary elements
+# --------------------------------------------------------------------------
+
+def test_private_ob_ow_scanned_standard_binary_listed():
+    deid = Dataset()
+    deid.add_new(0x00290010, "LO", "VENDOR")
+    deid.add_new(0x00291010, "OB", b"\x00\x01Patient: DOE^JANE\x00")
+    deid.add_new(0x00291020, "OW", b"MRN001\x00\x00")
+    deid.add_new(0x00420011, "OB", b"%PDF-1.4 ... Report for DOE ...")   # EncapsulatedDocument
+    deid.add_new(0x60003000, "OW", b"DOE overlay bits")                   # OverlayData (repeating group, no keyword): not scanned
+    hits = find_residual_phi(deid, {"DOE": "PatientName", "MRN001": "PatientID"}, frozenset())
+    assert {h["path"] for h in hits} == {"(0029,1010)", "(0029,1020)", "EncapsulatedDocument"}
+    assert unscanned_binary(deid) == ["(6000,3000)"]
+
+
+def test_unscanned_binary_recurses_and_skips_pixels():
+    ds = Dataset()
+    ds.PixelData = b"\x00" * 4
+    item = Dataset()
+    item.add_new(0x00281201, "OW", b"\x00\x01")                          # RedPaletteColorLookupTableData
+    ds.IconImageSequence = Sequence([item])
+    assert unscanned_binary(ds) == ["IconImageSequence[0].RedPaletteColorLookupTableData"]
+
+
+# --------------------------------------------------------------------------
+# Review: coverage gaps
+# --------------------------------------------------------------------------
+
+def test_diff_sequence_items_added():
+    o = Dataset()
+    o.ReferencedImageSequence = Sequence([ds_with(ReferencedSOPInstanceUID="1.2.3")])
+    n = Dataset()
+    n.ReferencedImageSequence = Sequence([ds_with(ReferencedSOPInstanceUID="1.2.3"),
+                                          ds_with(ReferencedSOPInstanceUID="9.9.9")])
+    c = by_path(diff_datasets(o, n))["ReferencedImageSequence"]
+    assert (c.action, c.original, c.new) == ("items_added", 1, 2)
+
+
+def test_patient_with_no_dates():
+    x = Crosswalk()
+    x.add_file("a", ds_with(PatientID="P1"), Dataset(), [])
+    assert x.patient_date_handling(x.patients["P1"]) == ("no dates present", None, True)
+    row = next(x.rows_patients())
+    assert (row["date_handling"], row["date_offset_days"]) == ("no dates present", "")
+
+
+# --------------------------------------------------------------------------
+# Review 2: trailing padding and 4:2:2 pixel size
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("n", [1, 3, 4, 8, 1000])
+def test_trailing_zero_padding_is_not_truncation(tmp_path, n):
+    p = make_dcm(tmp_path / "a.dcm")
+    p.write_bytes(p.read_bytes() + b"\x00" * n)
+    read_dicom(p)
+
+
+@pytest.mark.parametrize("tail", [b"\x01", b"\x00\x00\x07", b"\x08\x00"])
+def test_trailing_non_zero_bytes_still_rejected(tmp_path, tail):
+    p = make_dcm(tmp_path / "a.dcm")
+    p.write_bytes(p.read_bytes() + tail)
+    with pytest.raises(TruncatedDicomError):
+        read_dicom(p)
+
+
+def _ybr_422(path, n_bytes):
+    p = make_dcm(path)
+    ds = read_dicom(p)
+    ds.Rows = ds.Columns = 16
+    ds.SamplesPerPixel = 3
+    ds.PhotometricInterpretation = "YBR_FULL_422"
+    ds.PlanarConfiguration = 0
+    ds.PixelData = bytes(n_bytes)
+    ds.save_as(str(p), write_like_original=False)
+    return p
+
+
+def test_ybr_422_native_pixel_size(tmp_path):
+    p = _ybr_422(tmp_path / "a.dcm", 16 * 16 * 2)        # 4:2:2: 2 bytes per pixel at 8 bits
+    ds = read_dicom(p)                                    # valid file is accepted
+    assert expected_pixel_bytes(ds) == 16 * 16 * 2
+    ds.PhotometricInterpretation = "YBR_PARTIAL_422"
+    assert expected_pixel_bytes(ds) == 16 * 16 * 2
+    ds.PhotometricInterpretation = "RGB"
+    assert expected_pixel_bytes(ds) == 16 * 16 * 3
+
+
+def test_ybr_422_short_pixel_data_still_rejected(tmp_path):
+    p = _ybr_422(tmp_path / "a.dcm", 16 * 16 * 2 - 10)
+    with pytest.raises(TruncatedDicomError):
+        read_dicom(p)
+
+
+# --------------------------------------------------------------------------
+# Review 3: undefined-length sequence last; nit coverage
+# --------------------------------------------------------------------------
+
+def _sr(path, undefined=True, trailing=b""):
+    """A pixel-less SR whose last element is an (undefined-length) ContentSequence."""
+    p = make_dcm(path)
+    ds = read_dicom(p)
+    del ds.PixelData
+    item = Dataset()
+    item.ValueType = "TEXT"
+    item.TextValue = "dose report"
+    ds.ContentSequence = Sequence([item])
+    ds["ContentSequence"].is_undefined_length = undefined
+    ds.save_as(str(p), write_like_original=False)
+    if trailing:
+        p.write_bytes(p.read_bytes() + trailing)
+    return p
+
+
+@pytest.mark.parametrize("undefined", [True, False])
+def test_sequence_as_last_element_accepted(tmp_path, undefined):
+    ds = read_dicom(_sr(tmp_path / "sr.dcm", undefined))
+    assert ds.ContentSequence[0].TextValue == "dose report"
+
+
+def test_undefined_length_sequence_cut_mid_item_rejected(tmp_path):
+    p = _sr(tmp_path / "sr.dcm")
+    p.write_bytes(p.read_bytes()[:-20])
+    with pytest.raises(Exception):
+        read_dicom(p)
+
+
+def test_cut_into_all_zero_pixel_data_rejected(tmp_path):
+    p = make_dcm(tmp_path / "a.dcm")
+    ds = read_dicom(p)
+    ds.PixelData = bytes(64)
+    ds.save_as(str(p), write_like_original=False)
+    p.write_bytes(p.read_bytes()[:-10])              # what remains is zeros, but short
+    with pytest.raises(TruncatedDicomError):
+        read_dicom(p)
+
+
+@pytest.mark.parametrize("bits,frames", [(16, 1), (8, 3), (16, 2)])
+def test_ybr_422_16_bit_and_multiframe(tmp_path, bits, frames):
+    size = 16 * 16 * 2 * (bits // 8) * frames
+    p = _ybr_422(tmp_path / "a.dcm", size)
+    ds = read_dicom(p)
+    ds.BitsAllocated, ds.BitsStored, ds.HighBit = bits, bits, bits - 1
+    ds.NumberOfFrames = frames
+    ds.save_as(str(p), write_like_original=False)
+    assert expected_pixel_bytes(read_dicom(p)) == size
+    ds.PixelData = bytes(size - 2)
+    ds.save_as(str(p), write_like_original=False)
+    with pytest.raises(TruncatedDicomError):
+        read_dicom(p)
+
+
+@pytest.mark.parametrize("delta", [-30, -1])
+def test_cut_inside_file_meta_rejected(tmp_path, delta):
+    p = make_dcm(tmp_path / "a.dcm")
+    ds = read_dicom(p)
+    meta_end = 132 + 12 + ds.file_meta.FileMetaInformationGroupLength
+    p.write_bytes(p.read_bytes()[:meta_end + delta])
+    with pytest.raises(Exception):
+        read_dicom(p)
+
+
+def test_cut_inside_first_element_after_meta_rejected(tmp_path):
+    p = make_dcm(tmp_path / "a.dcm")
+    ds = read_dicom(p)
+    meta_end = 132 + 12 + ds.file_meta.FileMetaInformationGroupLength
+    p.write_bytes(p.read_bytes()[:meta_end + 5])          # part of the first element header
+    with pytest.raises(TruncatedDicomError):
+        read_dicom(p)
