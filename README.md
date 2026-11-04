@@ -179,16 +179,18 @@ Files are also checked for completeness when read. pydicom reads a truncated
 file without complaint and returns whatever it parsed before the end, so the
 plugin itself rejects, as `unreadable`:
 
-* files that end part-way through an element (trailing zero bytes after the
-  last element are accepted as padding, not truncation);
+* files that end inside the File Meta Information (checked against its
+  declared group length) or part-way through an element (trailing zero
+  bytes after the last element are accepted as padding, not truncation);
 * native (uncompressed) PixelData shorter than Rows × Columns × frames
   require (4:2:2 photometric interpretations such as `YBR_FULL_422` are
   sized at 2 samples per pixel);
-* datasets without a SOP Class/Instance UID.
-
 A file cut exactly on an element boundary is indistinguishable from a valid
 shorter file. The pixel-presence check and the diff (a run of `removed`
-elements) are what expose those.
+elements) are what expose those. Minimal objects are audited, not rejected:
+a DICOMDIR or a file with no SOP UIDs, and an anonymized file left with no
+elements at all (an original holding only private tags). The last is flagged
+as `anonymized_dataset_empty` so it is not missed.
 
 Each date is classified as one of:
 
@@ -235,16 +237,25 @@ values that survived byte-for-byte.
 
 How a value matches depends on its shape:
 
-* **Letters only** (a name component like `ANN` or `DOE`) must not run into
-  other **letters**. Digits and punctuation count as boundaries, since exports
-  often name folders `SMITH1/` or `DOE20240301/`. So `DOE` is found in
-  `DOE20240301/`, `Doe_Jane/`, `follow-up doe` and `DOE^JANE`, but `ANN` is
-  not found in `SCANNER` and `ZED` is not found in `ANONYMIZED`.
-* **Letters and digits** (an ID like `MRN001`, a number, a date) must not run
-  into other letters **or** digits, so a short accession number is not found
-  inside a hex hash, a longer number or a timestamp.
+* **A single word** (letters and/or digits: a name component like `DOE`, an ID
+  like `MRN001`, a date) matches only as a **whole word**: it must not run into
+  other letters or digits. So `DOE` is found in `Doe_Jane`, `follow-up doe` and
+  `DOE^JANE`. `ANN` is not found in `SCANNER`, `ZED` not in `ANONYMIZED`, `TSE`
+  not in a retained `SequenceName` of `T2TSE3D`, `ADA` not in a hex path hash,
+  and a short accession number not inside a longer number.
+* **In relative paths only**, a name component (letters only) may also touch
+  **digits**, because exports often name folders `SMITH1/` or `DOE20240301/`.
+  UUIDs and hex strings (8 or more hex characters mixing letters and digits,
+  such as a hash in a file name) are masked first, so `ADA` is not found
+  in `a90ada7ae450.dcm`. IDs and numbers keep the whole-word rule in paths
+  too, and are not masked, so an ID that looks like hex is still found.
 * **Anything else** (a full name with `^`, an institution with spaces, a UID
   with dots) matches as a substring.
+* **Placeholders are not searched:** `ANONYMIZED`, `ANONYMOUS`, `ANON`, `TEST`,
+  `PHANTOM`, `UNKNOWN`, `PATIENT`, `NONE`, `NULL`, `REMOVED`, `REDACTED`. An
+  original that was already anonymized (PatientName `Anonymized`) would
+  otherwise match the `ANONYMIZED` that dicom-anonymizer writes into other
+  tags, and a phantom or test patient would match `test` in its file name.
 
 Standard binary elements other than PixelData (overlays, LUTs, icon images…)
 are not searched. Each anonymized file's record lists them, and the summary
@@ -278,7 +289,7 @@ exactly one status:
 | `missing_original` | the anonymizer's summary lists a path absent from the original tree | pairing |
 | `unmatched_anonymized` | anonymized DICOM with no original counterpart | pairing |
 | `anonymized_not_dicom` | the original is DICOM but the output at that path is not | pairing |
-| `unreadable` | either side could not be parsed as conformant DICOM, or is truncated or empty | pairing |
+| `unreadable` | either side could not be parsed as conformant DICOM, or is truncated | pairing |
 | `dicom_without_preamble` | a DICOM dataset without the 128-byte preamble and `DICM` prefix. pl-dicom_anonymize skips these as non-DICOM, so the image is missing from the anonymized dataset | pairing |
 | `non_dicom_copied` | non-DICOM passed through unexamined (`--copyNonDicom`); content is scanned for leaks | warning |
 | `extra_anonymized_file` | non-DICOM in the anonymized tree with no original | warning |
@@ -312,7 +323,7 @@ Without `--failOnLeak`, the plugin exits 0 and you read `overall_status` from
 | `pixel_mismatch`: PixelData differs between the trees | integrity | error |
 | `pixel_missing`: PixelData present in only one of the pair | integrity | error |
 | `uid_one_to_many` / `uid_many_to_one`: inconsistent UID mapping | integrity | error |
-| `non_dicom_copied`, `extra_anonymized_file`, `unlisted_in_anonymizer_summary`, `non_dicom_partially_scanned` | coverage | warning |
+| `non_dicom_copied`, `extra_anonymized_file`, `unlisted_in_anonymizer_summary`, `non_dicom_partially_scanned`, `anonymized_dataset_empty` | coverage | warning |
 | `pseudonym_inconsistent`, `pseudonym_collision`, `uid_reference_emptied`, `date_offset_inconsistent`, `dates_retained` | consistency | warning |
 | `not_dicom`, `redaction_sidecar`, `pixel_redaction_unrecorded`, `binary_not_scanned` | coverage | info |
 
@@ -470,11 +481,20 @@ same rules. Tests assert this for clean and leaking runs alike.
   * reformatted values (`01/01/1980` versus `19800101`);
   * values shorter than `--residualMinLength`;
   * PHI that was never in a header element.
-* **False positives.** A short name component that is also a common word
-  (`ANN`, `MAY`, `LEE`) still matches wherever that word appears on its own.
-  Check `leaks.csv`, and raise `--residualMinLength` if needed. Conversely,
-  an ID embedded in a longer alphanumeric string (`MRN001234` when the ID is
-  `001234`) is not matched.
+* **False positives.** A name component that is exactly a scanner or common
+  word still matches wherever that word appears on its own. Measured with
+  9,495 real first and last names against the values pl-dicom_anonymize kept
+  in pydicom's 154 sample files plus typical MR/CT strings, only `SAG`,
+  `TSE` and `VIDA` matched in headers (`T2_TSE_SAG`, `MAGNETOM Vida`); against
+  1,000 realistic export paths, only `SAG`, `TSE` and `POST`
+  (`T1_SE_AX_POST/`). No name matched inside hex hashes, UUIDs or the
+  anonymizer's summary.
+  In headers, `--acknowledgeRetainedTags` silences an element kept on
+  purpose. **Paths cannot be silenced**, and a short surname can collide with
+  a series folder named after an MR sequence or orientation: patient `Tse`
+  against `T2_TSE/` or `T2TSE3D/`, patient `Sag` against `SAG2/`. Check
+  `leaks.csv` before concluding it is a real leak. Raising
+  `--residualMinLength` avoids this but also drops real three-letter names.
 * **Pixel PHI is not detected.** The pixel check only confirms PixelData passed
   through unchanged. Burned-in text is pl-dicom_pixel_redact's job.
 * **Cross-file text in headers is not checked.** Each file's headers are
@@ -487,14 +507,25 @@ same rules. Tests assert this for clean and leaking runs alike.
   than EncapsulatedDocument (overlays, LUTs, icon images) are not decoded as
   text (see `binary_not_scanned`). Text encoded as UTF-16 or compressed
   inside a private blob is not found either.
+* **Trailing bytes after encapsulated data are not checked.** Truncation
+  checks stop at an undefined-length last element (encapsulated PixelData,
+  or a sequence such as an SR's ContentSequence), so stray non-zero bytes
+  after it are accepted, while the same bytes after native data are not.
 * **Encapsulated PDFs are mostly opaque.** EncapsulatedDocument is decoded
   as latin-1 and scanned, which works for embedded CDA/XML reports. PDF page
   text is usually Flate-compressed, though, so a name inside an encapsulated
   PDF will rarely be found. Treat a clean scan of a PDF as unverified.
-* **Names run together with letters.** A name component fused with other
-  letters (`DoeJane`, `JDoe`) is not matched, nor is an ID fused with letters
-  (`scanMRN001` when the ID is `MRN001`). `Doe_Jane`, `Doe Jane`, `DOE^JANE`,
-  `SMITH1` and `DOE20240301` are matched.
+* **Values run together with other characters.**
+  * A name component fused with other letters is not matched anywhere
+    (`DoeJane`, `JDoe`).
+  * A name component fused with digits is matched in paths (`SMITH1/`,
+    `DOE20240301/`) but not in headers or non-DICOM content. This is the
+    price of not matching `TSE` inside `T2TSE3D` or `ADA` inside a hash.
+  * An ID or number fused with letters or digits is not matched anywhere
+    (`scanMRN001` for ID `MRN001`; `P12345/` for ID `12345`). This is
+    deliberate for paths too: allowing letters next to a numeric ID would
+    make short IDs like `001` match series and image folders such as
+    `S001/` and `IM001/` in almost every export.
 * **Scope of the UID mapping.** The mapping covers one anonymizer run, which
   matches pl-dicom_anonymize's own consistency scope.
 * **Inherits the sensitivity of its input.** The plugin cannot reduce the

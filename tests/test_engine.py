@@ -25,6 +25,7 @@ from audit_engine import (
     TruncatedDicomError,
     expected_pixel_bytes,
     looks_like_headerless_dicom,
+    mask_hex,
     unscanned_binary,
     is_dicom_file,
     phi_needles,
@@ -233,38 +234,58 @@ def test_token_in():
     assert not token_in("19800101", "X198001012")
 
 
+# expected = (in headers and non-DICOM content, in relative paths)
 @pytest.mark.parametrize("token,hay,expected", [
-    # the reviewer's false positives: single words match only as whole words
-    ("ANN", "ACME SCANNER CO.", False),
-    ("ZED", "ANONYMIZED", False),
-    ("ANN", "ANONYMIZED", False),
-    # real leaks still found
-    ("DOE", "DOE_JANE/S1/1.DCM", True),              # underscore separates words
-    ("DOE", "FOLLOW-UP DOE KNEE", True),
-    ("DOE", "DOE^JANE", True),
-    ("MRN001", "PRIVATE NOTE MRN001", True),
-    ("JOSÉ", "PATIENT JOSÉ", True),                  # Unicode letters are word characters
-    ("JOSÉ", "JOSÉE", False),
-    # review 2: digits are boundaries for letters-only tokens
-    ("SMITH", "SMITH1/1.DCM", True),
-    ("DOE", "DOE20240301/1.DCM", True),
-    ("ANN", "2ANN", True),
-    ("ANN", "SCANNER2", False),                      # still run into letters
-    # tokens containing digits keep the letter/digit boundary (hex hashes)
-    ("MRN001", "MRN001/1.DCM", True),
-    ("1234", "9A1234BC", False),
-    # fused with letters: documented misses
-    ("DOE", "DOEJANE", False),
-    ("MRN001", "SCANMRN001", False),
+    # the round-1 false positives: never inside other letters
+    ("ANN", "ACME SCANNER CO.", (False, False)),
+    ("ZED", "ANONYMIZED", (False, False)),
+    ("ANN", "SCANNER2", (False, False)),
+    # real leaks found everywhere
+    ("DOE", "DOE_JANE/S1/1.DCM", (True, True)),
+    ("DOE", "FOLLOW-UP DOE KNEE", (True, True)),
+    ("DOE", "DOE^JANE", (True, True)),
+    ("MRN001", "PRIVATE NOTE MRN001", (True, True)),
+    ("JOSÉ", "PATIENT JOSÉ", (True, True)),
+    ("JOSÉ", "JOSÉE", (False, False)),
+    # round 2: names next to digits, but only in paths
+    ("SMITH", "SMITH1/1.DCM", (False, True)),
+    ("DOE", "DOE20240301/1.DCM", (False, True)),
+    # round 3: names inside hex hashes and scanner values never match
+    ("ADA", '"PATH_HASH": "A90ADA7AE450"', (False, False)),
+    ("ADA", "SCANS/A90ADA7AE450.DCM", (False, False)),        # hex-named file
+    ("ADA", "ADA1/1.DCM", (False, True)),
+    ("EFE", "E1E437B7-F735-EFE6-08D1-80113E940BB4.DCM", (False, False)),   # UUID-named file
+    ("ADA", "ADA1/E1E437B7-F735-EFE6-08D1-80113E940BB4.DCM", (False, True)),
+    # scanner values: no longer matched in headers or content; a series folder
+    # with the same name in a path is still matched (trade-off, see README)
+    ("TSE", "T2TSE3D", (False, True)),
+    ("SAG", "SAG2", (False, True)),
+    ("VIDA", "VIDA3T", (False, True)),
+    # IDs and numbers: letter/digit boundary everywhere (hex hashes, longer numbers)
+    ("MRN001", "MRN001/1.DCM", (True, True)),
+    ("1234", "9A1234BC", (False, False)),
+    ("1234", "P1234/", (False, False)),                       # documented miss
+    ("AB12CD34", "ACC/AB12CD34/1.DCM", (True, True)),        # hex-looking ID not masked
     # multi-word / punctuated values stay substrings
-    ("DOE^JANE", "XDOE^JANEX", True),
-    ("GENERAL HOSPITAL", "THEGENERAL HOSPITALS", True),
+    ("DOE^JANE", "XDOE^JANEX", (True, True)),
+    ("GENERAL HOSPITAL", "THEGENERAL HOSPITALS", (True, True)),
+    # fused with letters: documented misses
+    ("DOE", "DOEJANE", (False, False)),
+    ("MRN001", "SCANMRN001", (False, False)),
 ])
 def test_whole_word_matching(token, hay, expected):
-    assert token_in(token, hay) is expected
+    in_content, in_path = expected
+    assert token_in(token, hay) is in_content
     idx = NeedleIndex()
     idx.add({token: "PatientName"})
-    assert bool(idx.search(hay)) is expected
+    assert bool(idx.search(hay)) is in_content
+    assert bool(idx.search(hay, path=True)) is in_path
+
+
+def test_mask_hex_keeps_names_and_ids():
+    assert mask_hex("A90ADA7AE450.DCM") == " " * 12 + ".DCM"
+    assert mask_hex("DOE20240301/ADA1/DEADBEEF/19800101") == "DOE20240301/ADA1/DEADBEEF/19800101"
+    assert mask_hex("E1E437B7-F735-EFE6-08D1-80113E940BB4.DCM") == " " * 36 + ".DCM"
 
 
 def test_needle_index():
@@ -401,13 +422,15 @@ def test_locate_trees(tmp_path):
 # --------------------------------------------------------------------------
 
 def _element_boundaries(path):
-    """Byte offsets where a top-level element (or the file meta) ends."""
+    """Byte offsets where the File Meta or a top-level element ends."""
     import warnings
     from pydicom.dataelem import RawDataElement
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ds = pydicom.dcmread(str(path))
-    return {r.value_tell + r.length for r in ds._dict.values() if isinstance(r, RawDataElement)}
+    meta_end = 132 + 12 + ds.file_meta.FileMetaInformationGroupLength
+    return {meta_end} | {r.value_tell + r.length for r in ds._dict.values()
+                         if isinstance(r, RawDataElement)}
 
 
 def test_truncation_detected_at_every_cut(tmp_path):
@@ -451,13 +474,33 @@ def test_expected_pixel_bytes_unknown_for_compressed(tmp_path):
     assert expected_pixel_bytes(ds) == (8 * 8 * 3 + 7) // 8
 
 
-def test_dataset_without_sop_uids_rejected(tmp_path):
+def test_dataset_without_sop_uids_is_accepted(tmp_path):
+    """Minimal but parseable objects (DICOMDIR, private-sequence fixtures) are
+    audited; truncation is detected separately."""
     p = make_dcm(tmp_path / "a.dcm")
     ds = read_dicom(p)
     del ds.SOPClassUID
+    del ds.SOPInstanceUID
     ds.save_as(str(p), write_like_original=False)
-    with pytest.raises(MalformedDicomError):
-        read_dicom(p)
+    assert "SOPClassUID" not in read_dicom(p)
+
+
+def test_empty_dataset_is_readable(tmp_path):
+    """An all-private original legitimately anonymizes to an empty dataset."""
+    p = make_dcm(tmp_path / "a.dcm")
+    ds = read_dicom(p)
+    for elem in list(ds):
+        del ds[elem.tag]
+    ds.save_as(str(p), write_like_original=False)
+    assert len(read_dicom(p)) == 0
+
+
+def test_placeholder_values_are_not_needles():
+    ds = ds_with(PatientName="Anonymized", OtherPatientNames="Test^Phantom",
+                 InstitutionName="Unknown")
+    assert phi_needles(ds, 3) == {"TEST^PHANTOM": "OtherPatientNames"}
+    ds = ds_with(PatientName="Testa^Anona")            # real names that merely start alike
+    assert {"TESTA", "ANONA"} <= set(phi_needles(ds, 3))
 
 
 def test_looks_like_headerless_dicom(tmp_path):
@@ -569,5 +612,82 @@ def test_ybr_422_native_pixel_size(tmp_path):
 
 def test_ybr_422_short_pixel_data_still_rejected(tmp_path):
     p = _ybr_422(tmp_path / "a.dcm", 16 * 16 * 2 - 10)
+    with pytest.raises(TruncatedDicomError):
+        read_dicom(p)
+
+
+# --------------------------------------------------------------------------
+# Review 3: undefined-length sequence last; nit coverage
+# --------------------------------------------------------------------------
+
+def _sr(path, undefined=True, trailing=b""):
+    """A pixel-less SR whose last element is an (undefined-length) ContentSequence."""
+    p = make_dcm(path)
+    ds = read_dicom(p)
+    del ds.PixelData
+    item = Dataset()
+    item.ValueType = "TEXT"
+    item.TextValue = "dose report"
+    ds.ContentSequence = Sequence([item])
+    ds["ContentSequence"].is_undefined_length = undefined
+    ds.save_as(str(p), write_like_original=False)
+    if trailing:
+        p.write_bytes(p.read_bytes() + trailing)
+    return p
+
+
+@pytest.mark.parametrize("undefined", [True, False])
+def test_sequence_as_last_element_accepted(tmp_path, undefined):
+    ds = read_dicom(_sr(tmp_path / "sr.dcm", undefined))
+    assert ds.ContentSequence[0].TextValue == "dose report"
+
+
+def test_undefined_length_sequence_cut_mid_item_rejected(tmp_path):
+    p = _sr(tmp_path / "sr.dcm")
+    p.write_bytes(p.read_bytes()[:-20])
+    with pytest.raises(Exception):
+        read_dicom(p)
+
+
+def test_cut_into_all_zero_pixel_data_rejected(tmp_path):
+    p = make_dcm(tmp_path / "a.dcm")
+    ds = read_dicom(p)
+    ds.PixelData = bytes(64)
+    ds.save_as(str(p), write_like_original=False)
+    p.write_bytes(p.read_bytes()[:-10])              # what remains is zeros, but short
+    with pytest.raises(TruncatedDicomError):
+        read_dicom(p)
+
+
+@pytest.mark.parametrize("bits,frames", [(16, 1), (8, 3), (16, 2)])
+def test_ybr_422_16_bit_and_multiframe(tmp_path, bits, frames):
+    size = 16 * 16 * 2 * (bits // 8) * frames
+    p = _ybr_422(tmp_path / "a.dcm", size)
+    ds = read_dicom(p)
+    ds.BitsAllocated, ds.BitsStored, ds.HighBit = bits, bits, bits - 1
+    ds.NumberOfFrames = frames
+    ds.save_as(str(p), write_like_original=False)
+    assert expected_pixel_bytes(read_dicom(p)) == size
+    ds.PixelData = bytes(size - 2)
+    ds.save_as(str(p), write_like_original=False)
+    with pytest.raises(TruncatedDicomError):
+        read_dicom(p)
+
+
+@pytest.mark.parametrize("delta", [-30, -1])
+def test_cut_inside_file_meta_rejected(tmp_path, delta):
+    p = make_dcm(tmp_path / "a.dcm")
+    ds = read_dicom(p)
+    meta_end = 132 + 12 + ds.file_meta.FileMetaInformationGroupLength
+    p.write_bytes(p.read_bytes()[:meta_end + delta])
+    with pytest.raises(Exception):
+        read_dicom(p)
+
+
+def test_cut_inside_first_element_after_meta_rejected(tmp_path):
+    p = make_dcm(tmp_path / "a.dcm")
+    ds = read_dicom(p)
+    meta_end = 132 + 12 + ds.file_meta.FileMetaInformationGroupLength
+    p.write_bytes(p.read_bytes()[:meta_end + 5])          # part of the first element header
     with pytest.raises(TruncatedDicomError):
         read_dicom(p)

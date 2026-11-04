@@ -104,7 +104,7 @@ def sanitize_exception(exc: BaseException) -> tuple[str, str]:
     name = type(exc).__name__
     known = {
         "InvalidDicomError": "file is not a valid DICOM file",
-        "MalformedDicomError": "file has DICOM magic bytes but no conformant File Meta Information, or no SOP Class/Instance UID",
+        "MalformedDicomError": "file has DICOM magic bytes but no conformant File Meta Information",
         "TruncatedDicomError": "file is truncated (ends part-way through an element, or PixelData is shorter than the image dimensions require)",
         "FileNotFoundError": "file disappeared or was unreadable",
         "PermissionError": "insufficient filesystem permissions",
@@ -139,10 +139,6 @@ class TruncatedDicomError(InvalidDicomError):
     """The file ends before its declared content (pydicom reads it silently)."""
 
 
-#: Elements a dataset must have to count as a DICOM object at all. pydicom
-#: returns whatever it parsed before EOF, so a file cut off mid-header comes
-#: back as a handful of elements rather than an error.
-_REQUIRED_ELEMENTS = ("SOPClassUID", "SOPInstanceUID")
 
 
 def expected_pixel_bytes(ds: Dataset) -> Optional[int]:
@@ -201,28 +197,58 @@ def check_not_truncated(ds: pydicom.dataset.FileDataset, path: Path) -> None:
     A cut exactly on an element boundary is a valid shorter file and cannot
     be told apart here; the pixel-presence check and the diff catch those.
     Skipped where offsets do not map to file bytes (deflated transfer syntax)
-    or the last element has undefined length (encapsulated pixel data,
-    undefined-length sequences).
+    or the last element has undefined length: encapsulated pixel data, or an
+    undefined-length sequence, which pydicom parses eagerly so it is not a
+    RawDataElement (an SR whose ContentSequence ends the file).
     """
+    size = path.stat().st_size
+    meta = getattr(ds, "file_meta", None)
+    # File Meta: 128-byte preamble + "DICM", then group 0002, always explicit
+    # VR little endian; (0002,0000) holds the byte length of the rest of it.
+    meta_end = None
+    group_len = get_elem(meta, "FileMetaInformationGroupLength") if meta is not None else None
+    if group_len is not None and group_len.value is not None:
+        meta_end = 132 + 12 + int(group_len.value)
+        if size < meta_end:
+            raise TruncatedDicomError("file ends inside the File Meta Information")
+
     raws = [r for r in ds._dict.values() if isinstance(r, RawDataElement)]
     for r in raws:
         if r.length != UNDEFINED_LENGTH and r.value is not None and len(r.value) < r.length:
             raise TruncatedDicomError("an element is shorter than its declared length")
-    ts = getattr(getattr(ds, "file_meta", None), "TransferSyntaxUID", None)
-    if not raws or (ts is not None and ts.is_deflated):
+    ts = getattr(meta, "TransferSyntaxUID", None) if meta is not None else None
+    if ts is not None and ts.is_deflated:
+        return
+    if not ds._dict:
+        # empty dataset: anything after the File Meta must be zero padding
+        if meta_end is not None and size > meta_end and not _only_zero_bytes(path, meta_end):
+            raise TruncatedDicomError("file ends part-way through its first element")
+        return
+    if not raws:
         return
     last = max(raws, key=lambda r: r.value_tell)
     if last.length == UNDEFINED_LENGTH:
         return
+    # pydicom parses undefined-length sequences eagerly, so they are not raw.
+    # If one follows the last raw element, its bytes (not truncation) are
+    # what comes after `last`; its end is not recorded, so stop here.
+    if any(not isinstance(e, RawDataElement) and t > last.tag for t, e in ds._dict.items()):
+        return
     end = last.value_tell + last.length
-    if end != path.stat().st_size and not _only_zero_bytes(path, end):
+    if end != size and not _only_zero_bytes(path, end):
         raise TruncatedDicomError("file ends part-way through an element")
 
 
 def check_complete(ds: Dataset) -> None:
-    """Raise if a dataset read without error is nevertheless incomplete."""
-    if any(kw not in ds for kw in _REQUIRED_ELEMENTS):
-        raise MalformedDicomError("dataset has no SOP Class/Instance UID (empty or cut off)")
+    """
+    Raise if native PixelData is shorter than the image needs. Cuts
+    mid-element are caught by check_not_truncated. Neither SOP UIDs nor any
+    element at all are required here: a minimal object (a DICOMDIR, a file of
+    only private tags) can legitimately come out of the anonymizer empty. An
+    image cut right after its File Meta loses its PixelData, which the pair's
+    pixel check reports (pixel_missing); an empty anonymized file is also
+    flagged by the CLI (anonymized_dataset_empty).
+    """
     if 0x7FE00010 in ds:
         expected = expected_pixel_bytes(ds)
         actual = len(ds[0x7FE00010].value or b"")
@@ -434,6 +460,16 @@ def classify_date(change: Change) -> tuple[str, Optional[int]]:
 # Residual PHI
 # --------------------------------------------------------------------------
 
+#: Values that stand in for a name or ID rather than identify anyone. Not
+#: searched for: an original that was already anonymized ("Anonymized") would
+#: otherwise match the "ANONYMIZED" dicom-anonymizer writes into other tags,
+#: and phantom/test patients would match "test" and "phantom" in paths.
+PLACEHOLDER_TOKENS = frozenset({
+    "ANONYMIZED", "ANONYMOUS", "ANON", "TEST", "PHANTOM", "UNKNOWN",
+    "PATIENT", "NONE", "NULL", "REMOVED", "REDACTED",
+})
+
+
 def phi_needles(identified: Dataset, min_len: int) -> dict[str, str]:
     """
     {UPPERCASE token: source keyword} from the identified header. Person
@@ -444,7 +480,8 @@ def phi_needles(identified: Dataset, min_len: int) -> dict[str, str]:
 
     def add(token: str, source: str):
         token = token.strip().upper()
-        if len(token) >= min_len and token not in {v for v in DUMMY_DATE_VALUES.values()}:
+        if (len(token) >= min_len and token not in PLACEHOLDER_TOKENS
+                and token not in {v for v in DUMMY_DATE_VALUES.values()}):
             needles.setdefault(token, source)
 
     for kw in RESIDUAL_SOURCE_KEYWORDS:
@@ -525,22 +562,24 @@ def is_word(token: str) -> bool:
     return token.isalnum()
 
 
-def token_pattern(token: str) -> str:
+def token_pattern(token: str, path: bool = False) -> str:
     """
     Regex for one needle (already upper-case).
 
-    * Letters only (a name component such as "ANN" or "DOE"): must not run
-      into other LETTERS. Digits and punctuation are boundaries, because
-      exports often name folders "SMITH1/" or "DOE20240301/". So "ANN" is not
-      found in "SCANNER" and "ZED" not in "ANONYMIZED", but "DOE" is found in
-      "DOE20240301/", "Doe_Jane/", "follow-up doe" and "DOE^JANE".
-    * Letters and digits (an ID such as "MRN001", a number such as "1234",
-      a date): must not run into other letters OR digits, so a short number
-      is not found inside a hex hash, a longer number or a timestamp.
+    * A single word (letters and/or digits: a name component such as "ANN",
+      an ID such as "MRN001", a date) matches only as a whole word: it must
+      not run into other letters OR digits. So "ANN" is not found in
+      "SCANNER", "TSE" not in "T2TSE3D", "ADA" not in a hex hash, "1234" not
+      in a longer number; "DOE" is found in "Doe_Jane", "follow-up doe" and
+      "DOE^JANE".
+    * path=True (relative paths of the anonymized tree only): a letters-only
+      token may also touch digits, because exports name folders "SMITH1/"
+      and "DOE20240301/". Hex strings are masked first, see
+      NeedleIndex.search.
     * Anything else (a full name with "^", an institution with spaces, a
       UID with dots) is a plain substring.
     """
-    if token.isalpha():
+    if path and token.isalpha():
         return rf"(?<!{_LETTER}){re.escape(token)}(?!{_LETTER})"
     if is_word(token):
         return rf"(?<!{_WORDCHAR}){re.escape(token)}(?!{_WORDCHAR})"
@@ -635,6 +674,20 @@ def find_residual_phi_in_file(deidentified: pydicom.dataset.FileDataset,
     return hits
 
 
+#: A whole UUID (its 4-character segments are too short for _HEX_RUN), or a
+#: standalone run of 8+ hex characters with at least one letter and one digit:
+#: a hash, not a name.
+_UUID = re.compile(r"(?<![^\W_])[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}(?![^\W_])")
+_HEX_RUN = re.compile(r"(?<![^\W_])(?=[0-9A-F]*[0-9])(?=[0-9A-F]*[A-F])[0-9A-F]{8,}(?![^\W_])")
+
+
+def mask_hex(upper: str) -> str:
+    """Blank UUIDs and hex runs (same length, so offsets are kept) in
+    upper-case text."""
+    blank = lambda m: " " * len(m.group(0))  # noqa: E731
+    return _HEX_RUN.sub(blank, _UUID.sub(blank, upper))
+
+
 class NeedleIndex:
     """
     Every identifying token seen across the whole run, for scanning things
@@ -645,25 +698,47 @@ class NeedleIndex:
 
     def __init__(self):
         self.tokens: dict[str, str] = {}
-        self._rx = None
+        self._rx: dict = {}
 
     def add(self, needles: dict[str, str]):
         for t, src in needles.items():
             if t not in self.tokens:
                 self.tokens[t] = src
-                self._rx = None
+                self._rx = {}
 
     def __len__(self):
         return len(self.tokens)
 
-    def search(self, text: str) -> list[tuple[str, str]]:
-        """[(matched token, source keyword)], distinct, case-insensitive."""
+    def _compiled(self, key: str, tokens: list, path: bool):
+        if key not in self._rx:
+            alts = sorted(tokens, key=len, reverse=True)
+            self._rx[key] = re.compile("|".join(token_pattern(a, path) for a in alts)) if alts else None
+        return self._rx[key]
+
+    def search(self, text: str, path: bool = False) -> list[tuple[str, str]]:
+        """
+        [(matched token, source keyword)], distinct, case-insensitive.
+
+        path=True is for relative paths: letters-only tokens may touch digits
+        (see token_pattern) and are matched against the text with hex strings
+        masked, so "ADA" is found in "ADA1/" but not in a file named
+        "a90ada7ae450.dcm". Every other token sees the unmasked text, so an ID
+        that happens to look like hex is still found.
+        """
         if not self.tokens or not text:
             return []
-        if self._rx is None:
-            alts = sorted(self.tokens, key=len, reverse=True)
-            self._rx = re.compile("|".join(token_pattern(a) for a in alts))
-        found = dict.fromkeys(m.group(0) for m in self._rx.finditer(text.upper()))
+        upper = text.upper()
+        if not path:
+            rx = self._compiled("strict", list(self.tokens), False)
+            hits = rx.finditer(upper)
+        else:
+            letters = [t for t in self.tokens if t.isalpha()]
+            others = [t for t in self.tokens if not t.isalpha()]
+            rx_l = self._compiled("path_letters", letters, True)
+            rx_o = self._compiled("path_others", others, True)
+            hits = [m for rx, hay in ((rx_l, mask_hex(upper)), (rx_o, upper)) if rx
+                    for m in rx.finditer(hay)]
+        found = dict.fromkeys(m.group(0) for m in hits)
         return [(t, self.tokens[t]) for t in found]
 
 

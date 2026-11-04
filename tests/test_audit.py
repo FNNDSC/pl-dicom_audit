@@ -670,3 +670,124 @@ def test_trailing_zero_padding_audits_normally(anonymized, outdir, options, side
     f.write_bytes(f.read_bytes() + b"\x00\x00\x00")
     assert run(options, anonymized, outdir) == 0
     assert _statuses(outdir)["p02/s1/1.dcm"] == "audited"
+
+
+
+# --------------------------------------------------------------------------
+# Review 3 (9483a5c)
+# --------------------------------------------------------------------------
+
+def test_name_inside_path_hash_is_not_a_leak(tmp_path, outdir, options):
+    """Ada^Lovelace vs the anonymizer summary's hex path_hash a90ada7ae450."""
+    root = tmp_path / "in"
+    make_dcm(root / ORIG / "p01/1.dcm", name="Lovelace^Ada", pid="MRN777", private=False)
+    anonymize_tree(root / ORIG, root / ANON)
+    sp = root / ANON / "deidentification_summary.json"
+    s = json.loads(sp.read_text())
+    s["files"][0]["path_hash"] = "a90ada7ae450"
+    sp.write_text(json.dumps(s))
+    assert run(options, root, outdir) == 0
+    assert summary(outdir)["leaks"]["non_dicom_files"] == 0
+
+
+def test_hex_named_files_are_not_a_leak(tmp_path, outdir, options):
+    root = tmp_path / "in"
+    make_dcm(root / ORIG / "scans/a90ada7ae450.dcm", name="Lovelace^Ada", pid="MRN777",
+             private=False)
+    anonymize_tree(root / ORIG, root / ANON)
+    assert run(options, root, outdir) == 0
+    assert summary(outdir)["leaks"]["paths"] == 0
+
+
+@pytest.mark.parametrize("name,kw,value", [
+    ("Tse^Rick", "SequenceName", "T2TSE3D"),
+    ("Sag^Dana", "SequenceName", "SAG2"),
+    ("Vida^Mina", "ManufacturerModelName", "VIDA3T"),
+])
+def test_short_surnames_vs_retained_scanner_values(tmp_path, outdir, options, name, kw, value):
+    root = tmp_path / "in"
+    make_dcm(root / ORIG / "p01/1.dcm", name=name, private=False)
+    rewrite(root / ORIG / "p01/1.dcm", lambda ds: setattr(ds, kw, value))
+    anonymize_tree(root / ORIG, root / ANON)
+    assert run(options, root, outdir) == 0
+    assert summary(outdir)["leaks"]["header_files"] == 0
+
+
+@pytest.mark.parametrize("sides", [(ORIG, ANON), (ANON,)])
+def test_sr_with_undefined_length_sequence_last(tmp_path, outdir, options, sides):
+    root = tmp_path / "in"
+    p = make_dcm(root / ORIG / "p01/1.dcm", private=False)
+
+    def to_sr(ds):
+        del ds.PixelData
+        item = Dataset()
+        item.ValueType = "TEXT"
+        item.TextValue = "dose report"
+        ds.ContentSequence = Sequence([item])
+    rewrite(p, to_sr)
+    anonymize_tree(root / ORIG, root / ANON)
+    for side in sides:
+        rewrite(root / side / "p01/1.dcm",
+                lambda ds: setattr(ds["ContentSequence"], "is_undefined_length", True))
+    assert run(options, root, outdir) == 0
+    assert _statuses(outdir)["p01/1.dcm"] == "audited"
+    assert summary(outdir)["pixels"]["integrity"] == {"absent_both": 1}
+
+
+
+# --------------------------------------------------------------------------
+# Found by running pydicom's sample corpus through the real pipeline
+# --------------------------------------------------------------------------
+
+def test_all_private_original_anonymizes_to_empty(tmp_path, outdir, options):
+    """Like pydicom's priv_SQ.dcm: only private tags, all stripped."""
+    from pydicom.dataset import FileDataset, FileMetaDataset
+    from pydicom.uid import ExplicitVRLittleEndian
+    root = tmp_path / "in"
+    p = root / ORIG / "a/1.dcm"
+    p.parent.mkdir(parents=True)
+    meta = FileMetaDataset()
+    meta.MediaStorageSOPClassUID = "1.2.840.10008.5.1.4.1.1.7"
+    meta.MediaStorageSOPInstanceUID = generate_uid()
+    meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    ds = FileDataset(str(p), {}, file_meta=meta, preamble=b"\0" * 128)
+    ds.add_new(0x00290010, "LO", "VENDOR")
+    ds.add_new(0x00291010, "LO", "vendor note")
+    ds.is_little_endian, ds.is_implicit_VR = True, False
+    ds.save_as(str(p), write_like_original=False)
+    anonymize_tree(root / ORIG, root / ANON)
+    assert run(options, root, outdir) == 0
+    assert _statuses(outdir)["a/1.dcm"] == "audited"
+    assert "anonymized_dataset_empty" in codes(outdir)
+
+
+def test_image_cut_right_after_file_meta_fails(anonymized, outdir, options):
+    """A boundary cut that leaves an empty dataset still fails: pixels are gone."""
+    import warnings
+    f = anonymized / ANON / "p02/s1/1.dcm"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        first = min(e.value_tell for e in pydicom.dcmread(str(f))._dict.values()) - 8
+    f.write_bytes(f.read_bytes()[:first])                # end of File Meta Information
+    assert run(options, anonymized, outdir) == 1
+    assert "pixel_missing" in codes(outdir)
+    assert "anonymized_dataset_empty" in codes(outdir)
+
+
+def test_already_anonymized_original_is_not_a_leak(tmp_path, outdir, options):
+    """Like pydicom's ExplVR_BigEnd.dcm: PatientName 'Anonymized' vs the
+    anonymizer's own 'ANONYMIZED' replacement values."""
+    root = tmp_path / "in"
+    make_dcm(root / ORIG / "a/1.dcm", name="Anonymized", private=False)
+    anonymize_tree(root / ORIG, root / ANON)
+    assert run(options, root, outdir) == 0
+    assert summary(outdir)["leaks"]["header_files"] == 0
+
+
+def test_test_patient_named_like_the_file(tmp_path, outdir, options):
+    """Like pydicom's test-SR.dcm: patient 'Test^S R' in a file named test-SR.dcm."""
+    root = tmp_path / "in"
+    make_dcm(root / ORIG / "test-SR.dcm", name="Test^S R", private=False)
+    anonymize_tree(root / ORIG, root / ANON)
+    assert run(options, root, outdir) == 0
+    assert summary(outdir)["leaks"]["paths"] == 0

@@ -352,6 +352,7 @@ def audit_pair(e: Entry, orig: Path, anon: Path, xwalk: Crosswalk, needles: Need
                                      if c.action == "retained" and c.keyword in WATCHED_KEYWORDS}),
         changes=[c.as_dict() for c in changes],
         leaks=leaks,
+        anonymized_empty=len(dds) == 0 and len(ids) > 0,
         binary_not_scanned=not_scanned,
         pixel_integrity=pixels,
         pixel_redaction=redaction,
@@ -373,7 +374,7 @@ def scan_anonymized_tree(anon: Path, needles: NeedleIndex) -> tuple[list[dict], 
     stats: Counter = Counter()
     for f in sorted(p for p in anon.rglob("*") if p.is_file()):
         rel = str(f.relative_to(anon))
-        for token, src in needles.search(rel):
+        for token, src in needles.search(rel, path=True):
             rows.append({"file": rel, "location": "<path>", "kind": "path",
                          "source_keyword": src, "matched": token, "occurrences": 1})
         if is_dicom_file(f):
@@ -516,6 +517,7 @@ def audit(options: Namespace, inputdir: Path, outputdir: Path):
     pixel_mismatch_files: list[str] = []
     pixel_missing_files: list[str] = []
     unlisted: list[str] = []
+    empty_outputs = 0
     total_boxes = 0
     redaction_rows: list[dict] = []
     file_index: list[dict] = []
@@ -551,6 +553,7 @@ def audit(options: Namespace, inputdir: Path, outputdir: Path):
                                   if "anonymized_sha256" in rec else {})})
             action_counts.update(rec.get("action_counts", {}))
             retained_identifying.update(rec.get("identifying_retained", []))
+            empty_outputs += bool(rec.get("anonymized_empty"))
             # keyword only (last path segment): standard elements, never PHI
             not_scanned.update(p.rsplit(".", 1)[-1] for p in rec.get("binary_not_scanned", []))
 
@@ -677,6 +680,9 @@ def audit(options: Namespace, inputdir: Path, outputdir: Path):
     finding("non_dicom_partially_scanned", "coverage", "warning", tree_stats["non_dicom_truncated"]
             + tree_stats["non_dicom_unreadable"],
             f"non-DICOM files only partially scanned (over {NON_DICOM_SCAN_LIMIT} bytes) or unreadable")
+    finding("anonymized_dataset_empty", "coverage", "warning", empty_outputs,
+            "anonymized files with no elements left (e.g. the original held only private "
+            "tags); check this was intended")
     finding("pseudonym_inconsistent", "consistency", "warning", len(pseudo_inconsistent),
             "a patient received more than one anonymized PatientID")
     finding("pseudonym_collision", "consistency", "warning", len(pseudo_collisions),
